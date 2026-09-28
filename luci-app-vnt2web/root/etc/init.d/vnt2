@@ -2,28 +2,30 @@
 
 START=99
 USE_PROCD=1
-EXTRA_COMMANDS="schedule_restart refresh_latest_versions"
-EXTRA_HELP="\tschedule_restart\tQueue a restart for the vnt2 worker\n\trefresh_latest_versions\tRefresh cached latest release versions"
+EXTRA_COMMANDS="schedule_restart refresh_latest_versions download_missing"
+EXTRA_HELP="\tschedule_restart\tQueue a restart for the vnt2 worker\n\trefresh_latest_versions\tRefresh cached latest release versions\n\tdownload_missing\tDownload a missing vnt2_web binary in the background"
 
-CONF="vnt2"
+CONF="${CONF:-vnt2}"
 
-WEB_LOG="/tmp/vnt2-web.log"
-DOWNLOAD_LOG="/tmp/vnt2-download.log"
+WEB_LOG="${WEB_LOG:-/tmp/vnt2-web.log}"
+DOWNLOAD_LOG="${DOWNLOAD_LOG:-/tmp/vnt2-download.log}"
 
-WEB_TIME="/tmp/vnt2_web_time"
+WEB_TIME="${WEB_TIME:-/tmp/vnt2_web_time}"
 
 WEB_CONF_DEFAULT="/etc/config/vnt2.toml"
 
-WEB_CONF_FILE=""
+WEB_CONF_FILE="${WEB_CONF_FILE:-}"
 
-DOWNLOAD_CACHE_BASE="/tmp/vnt2-download-cache"
-DOWNLOAD_WEB_STATE="/tmp/vnt2-download-web.state"
+DOWNLOAD_CACHE_BASE="${DOWNLOAD_CACHE_BASE:-/tmp/vnt2-download-cache}"
+DOWNLOAD_WEB_STATE="${DOWNLOAD_WEB_STATE:-/tmp/vnt2-download-web.state}"
 VERSION_STATE_FILE="/etc/config/vnt2-web.version"
-GH_PROXY_PREFIX="https://gh-proxy.com/"
+GH_PROXY_PREFIX="${GH_PROXY_PREFIX:-https://gh-proxy.com/}"
 DOWNLOAD_MIRROR_RETRIES=3
-RESTART_PENDING_FILE="/tmp/vnt2-restart.pending"
+RESTART_PENDING_FILE="${RESTART_PENDING_FILE:-/tmp/vnt2-restart.pending}"
+DOWNLOAD_MISSING_PENDING_FILE="${VNT2_DOWNLOAD_PENDING_FILE:-/tmp/vnt2-download-missing.pending}"
+JUST_INSTALLED_MARKER="${JUST_INSTALLED_MARKER:-/tmp/vnt2-just-installed}"
 
-INSTALL_BIN_DIR="/usr/bin"
+INSTALL_BIN_DIR="${INSTALL_BIN_DIR:-/usr/bin}"
 
 . /lib/functions.sh
 . /lib/functions/procd.sh
@@ -45,8 +47,14 @@ log_download() {
 }
 
 ensure_log_files() {
-	[ -f "${WEB_LOG}" ] || : >"${WEB_LOG}"
-	[ -f "${DOWNLOAD_LOG}" ] || : >"${DOWNLOAD_LOG}"
+	if [ ! -f "${WEB_LOG}" ]; then
+		: >"${WEB_LOG}"
+		chmod 600 "${WEB_LOG}" >/dev/null 2>&1
+	fi
+	if [ ! -f "${DOWNLOAD_LOG}" ]; then
+		: >"${DOWNLOAD_LOG}"
+		chmod 600 "${DOWNLOAD_LOG}" >/dev/null 2>&1
+	fi
 }
 
 get_first_section_id() {
@@ -144,10 +152,16 @@ format_socket_addr() {
 }
 
 valid_port() {
+	local port
+
 	case "$1" in
 		""|*[!0-9]*) return 1 ;;
 	esac
-	[ "$1" -ge 1 ] 2>/dev/null && [ "$1" -le 65535 ] 2>/dev/null
+	# Normalize the value so a zero-padded port such as 019099 is not
+	# silently accepted as a second, different port.
+	port="$(printf '%d' "$1" 2>/dev/null)" || return 1
+	[ -n "$port" ] || return 1
+	[ "$port" -ge 1 ] && [ "$port" -le 65535 ]
 }
 
 ensure_conf_path_ready() {
@@ -159,8 +173,12 @@ ensure_conf_path_ready() {
 
 	conf_dir="${conf_path%/*}"
 	if [ -n "$conf_dir" ] && [ "$conf_dir" != "$conf_path" ]; then
-		mkdir -p "$conf_dir" >/dev/null 2>&1 || return 1
-		chmod 755 "$conf_dir" >/dev/null 2>&1 || return 1
+		# Only tighten the permissions of a directory this run created: an
+		# existing directory may have been hardened by the administrator.
+		if [ ! -d "$conf_dir" ]; then
+			mkdir -p "$conf_dir" >/dev/null 2>&1 || return 1
+			chmod 755 "$conf_dir" >/dev/null 2>&1 || return 1
+		fi
 	fi
 
 	if [ -e "$conf_path" ]; then
@@ -184,7 +202,14 @@ write_download_state() {
 	local arch="$6"
 	local path="$7"
 
-	message="$(normalize_log_text "$message")"
+	# The state file is parsed as key=value lines, so every value must be
+	# stripped of newlines before it is written.
+	state="$(normalize_state_value "$state")"
+	message="$(normalize_state_value "$message")"
+	asset="$(normalize_state_value "$asset")"
+	tag="$(normalize_state_value "$tag")"
+	arch="$(normalize_state_value "$arch")"
+	path="$(normalize_state_value "$path")"
 
 	cat >"${state_file}" <<EOF
 state=${state}
@@ -210,9 +235,12 @@ file_mtime() {
 
 file_size() {
 	local path="$1"
+	local size
 
 	[ -f "$path" ] || return 1
-	wc -c <"$path" 2>/dev/null | tr -d '[:space:]'
+	size="$(wc -c <"$path" 2>/dev/null | tr -d '[:space:]')"
+	[ -n "$size" ] || return 1
+	printf '%s\n' "$size"
 }
 
 write_version_state() {
@@ -444,38 +472,50 @@ download_file() {
 	local actual_url
 	local connect_timeout=20
 	local transfer_timeout=600
+	local accept_header="application/vnd.github+json, application/octet-stream, */*"
+	local proto_args=""
 
 	if [ "$purpose" = "api" ]; then
 		connect_timeout=10
 		transfer_timeout=30
+		accept_header="application/vnd.github+json"
 	fi
 
 	downloader="$(get_downloader "$purpose")" || return 1
 	DOWNLOAD_LAST_TOOL="$downloader"
 	DOWNLOAD_LAST_URL=""
+	DOWNLOAD_RATE_LIMITED=0
 
-	for actual_url in $(get_download_url_candidates_for_mirror "$url" "$mirror" "$custom_mirror_url"); do
+	while IFS= read -r actual_url; do
+		[ -n "$actual_url" ] || continue
 		DOWNLOAD_LAST_URL="$actual_url"
+
+		proto_args=""
+		case "$actual_url" in
+			# Keep an https candidate from being redirected to plain http.
+			https://*) proto_args="--proto =https --proto-redir =https" ;;
+		esac
 
 		case "$downloader" in
 			curl)
 				curl -fsSL --connect-timeout "$connect_timeout" --max-time "$transfer_timeout" --retry 0 \
 					-A "luci-app-vnt2web" \
-					-H "Accept: application/vnd.github+json, application/octet-stream, */*" \
+					-H "Accept: ${accept_header}" \
+					$proto_args \
 					-o "$out" "$actual_url" >/dev/null 2>&1
 				rc=$?
 			;;
 			wget)
 				wget -q --timeout="$transfer_timeout" --tries=1 \
 					--header="User-Agent: luci-app-vnt2web" \
-					--header="Accept: application/vnd.github+json, application/octet-stream, */*" \
+					--header="Accept: ${accept_header}" \
 					-O "$out" "$actual_url" >/dev/null 2>&1
 				rc=$?
 			;;
 			uclient-fetch)
 				uclient-fetch -q -T "$transfer_timeout" \
 					--header "User-Agent: luci-app-vnt2web" \
-					--header "Accept: application/vnd.github+json, application/octet-stream, */*" \
+					--header "Accept: ${accept_header}" \
 					-O "$out" "$actual_url" >/dev/null 2>&1
 				rc=$?
 			;;
@@ -485,9 +525,16 @@ download_file() {
 		esac
 
 		[ "$rc" -eq 0 ] && return 0
+		# An unauthenticated GitHub API request is rate limited to 60 calls
+		# per hour, so surface that case instead of a generic failure.
+		if [ "$purpose" = "api" ] && [ -s "$out" ] && grep -q 'API rate limit' "$out" 2>/dev/null; then
+			DOWNLOAD_RATE_LIMITED=1
+		fi
 		# A failed downloader may leave a partial file behind.
 		rm -f "$out"
-	done
+	done <<EOF
+$(get_download_url_candidates_for_mirror "$url" "$mirror" "$custom_mirror_url")
+EOF
 
 	return 1
 }
@@ -515,22 +562,6 @@ is_github_download_url() {
 			return 1
 		;;
 	esac
-}
-
-get_download_url_candidates() {
-	local url="$1"
-	local raw_url
-
-	url="$(trim_value "$url")"
-	raw_url="$(strip_github_proxy_url "$url")"
-	[ -n "$raw_url" ] || return 0
-
-	if is_github_download_url "$raw_url"; then
-		printf '%s\n' "${GH_PROXY_PREFIX}${raw_url}"
-		printf '%s\n' "$raw_url"
-	else
-		printf '%s\n' "$raw_url"
-	fi
 }
 
 get_download_url_candidates_for_mirror() {
@@ -650,10 +681,13 @@ select_download_mirror() {
 	local mirror="$2"
 	local candidate
 
-	for candidate in $(get_download_mirror_candidates "$repo" "$mirror"); do
+	while IFS= read -r candidate; do
+		[ -n "$candidate" ] || continue
 		echo "$candidate"
 		return 0
-	done
+	done <<EOF
+$(get_download_mirror_candidates "$repo" "$mirror")
+EOF
 
 	echo "github"
 }
@@ -779,9 +813,13 @@ refresh_latest_version_for_section() {
 	custom_mirror_url="$(normalize_custom_mirror_url "$custom_mirror_url")"
 	query_dir="${DOWNLOAD_CACHE_BASE}/latest_$(sanitize_name "${scope}_${mirror}_${repo}_${custom_mirror_url}")"
 	json_file="${query_dir}/release.json"
-	mkdir -p "$query_dir"
+	secure_cache_dir "$query_dir" || {
+		log_download "failed to create query directory ${query_dir}"
+		return 1
+	}
 
-	for candidate in $(get_download_mirror_candidates "$repo" "$mirror"); do
+	while IFS= read -r candidate; do
+		[ -n "$candidate" ] || continue
 		retry_limit="$DOWNLOAD_MIRROR_RETRIES"
 		[ "$candidate" = "custom" ] && retry_limit=1
 		for attempt in $(seq 1 "$retry_limit"); do
@@ -796,7 +834,9 @@ refresh_latest_version_for_section() {
 			rm -f "$json_file"
 			return 0
 		done
-	done
+	done <<EOF
+$(get_download_mirror_candidates "$repo" "$mirror")
+EOF
 
 	rm -f "$json_file"
 	log_download "latest version check failed repo=${repo} strategy=${mirror} scope=${scope}"
@@ -812,18 +852,6 @@ refresh_latest_versions() {
 
 	refresh_latest_version_for_section "$web_cfg" "vnt-dev/vnt" "web" || rc=1
 	return "$rc"
-}
-
-get_release_list_url() {
-	local repo="$1"
-	local mirror="$2"
-	local effective_mirror
-
-	[ -n "$repo" ] || repo="vnt-dev/vnt"
-	effective_mirror="$(select_download_mirror "$repo" "$mirror")"
-
-	# The selected mirror determines the release endpoint and transport.
-	echo "https://api.github.com/repos/${repo}/releases"
 }
 
 get_release_api_url() {
@@ -858,12 +886,14 @@ get_release_api_candidates() {
 		gitee|gitlab|cloudflare)
 			project="$(repo_to_mirror_project "$repo")" || effective_mirror="github"
 			if [ "$effective_mirror" != "github" ]; then
+				# The release endpoint always follows the configured
+				# download_repo instead of a hard-coded mirror account.
 				case "$effective_mirror" in
 					gitee)
-						echo "https://gitee.com/api/v5/repos/whzhni/${project}/releases"
+						echo "https://gitee.com/api/v5/repos/${repo}/releases"
 					;;
 					gitlab)
-						echo "https://gitlab.com/api/v4/projects/whzhni%2F${project}/releases"
+						echo "https://gitlab.com/api/v4/projects/$(printf '%s' "$repo" | sed 's#/#%2F#')/releases"
 					;;
 					cloudflare)
 						echo "https://pub-8a57d35d70d5423aac22a3316867e7ce.r2.dev/${project}/releases"
@@ -1044,7 +1074,8 @@ fetch_release_metadata_from_mirror() {
 	effective_mirror="$(select_download_mirror "$repo" "$mirror")"
 	requested_tag="$(normalize_release_tag "$tag")"
 
-	for candidate in $(get_release_api_candidates "$repo" "$tag" "$effective_mirror"); do
+	while IFS= read -r candidate; do
+		[ -n "$candidate" ] || continue
 		log_download "checking release endpoint: ${candidate}"
 		if download_file "$candidate" "$json_file" "api" "$effective_mirror" "$custom_mirror_url"; then
 			response_tag="$(sed -n 's/.*"tag_name"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' "$json_file" | head -n1)"
@@ -1078,8 +1109,14 @@ fetch_release_metadata_from_mirror() {
 				echo "$candidate"
 				return 0
 			fi
+		else
+			if [ "${DOWNLOAD_RATE_LIMITED:-0}" = "1" ]; then
+				log_download "release endpoint rate limited: ${candidate}"
+			fi
 		fi
-	done
+	done <<EOF
+$(get_release_api_candidates "$repo" "$tag" "$effective_mirror")
+EOF
 
 	return 1
 }
@@ -1169,7 +1206,8 @@ select_release_asset() {
 	urls="$(extract_release_urls "$json_file")"
 	[ -n "$urls" ] || return 1
 
-	for expected in $(get_release_asset_name_candidates "$scope" "$version" "$arch_name"); do
+	while IFS= read -r expected; do
+		[ -n "$expected" ] || continue
 		while IFS= read -r url; do
 			filename="${url##*/}"
 			filename="${filename%%\?*}"
@@ -1180,7 +1218,9 @@ select_release_asset() {
 		done <<EOF
 $urls
 EOF
-	done
+	done <<EOF
+$(get_release_asset_name_candidates "$scope" "$version" "$arch_name")
+EOF
 
 	return 1
 }
@@ -1224,6 +1264,36 @@ END { exit bad }
 '
 }
 
+zip_entry_names() {
+	local asset_file="$1"
+	local listing
+
+	# Full unzip lists bare entry names, the BusyBox applet only knows -l,
+	# and bsdtar can read the zip central directory as a last resort.
+	if command -v unzip >/dev/null 2>&1; then
+		listing="$(unzip -Z1 "$asset_file" 2>/dev/null)" && {
+			printf '%s\n' "$listing"
+			return 0
+		}
+	fi
+	if command -v busybox >/dev/null 2>&1; then
+		listing="$(busybox unzip -l "$asset_file" 2>/dev/null)" || return 1
+		printf '%s\n' "$listing" | awk '
+			$1 ~ /^[0-9]+$/ && NF >= 4 {
+				$1 = ""; $2 = ""; $3 = ""
+				sub(/^[[:space:]]+/, "")
+				print
+			}
+		'
+		return 0
+	fi
+	if command -v bsdtar >/dev/null 2>&1; then
+		bsdtar -tf "$asset_file" 2>/dev/null
+		return $?
+	fi
+	return 1
+}
+
 archive_is_safe() {
 	local asset_file="$1"
 	local entries details
@@ -1248,25 +1318,26 @@ archive_is_safe() {
 			' || return 1
 		;;
 		*.zip)
-			if command -v unzip >/dev/null 2>&1; then
-				entries="$(unzip -Z1 "$asset_file" 2>/dev/null)" || return 1
-				printf '%s\n' "$entries" | archive_paths_are_safe || return 1
+			entries="$(zip_entry_names "$asset_file")" || {
+				log_download "unable to list zip entries, no usable unzip tool: ${asset_file}"
+				return 1
+			}
+			[ -n "$entries" ] || return 1
+			printf '%s\n' "$entries" | archive_paths_are_safe || return 1
+			# Full unzip reports the entry type; the BusyBox applet cannot,
+			# so the link and special file check only runs when available.
+			if unzip -Z -l "$asset_file" >/dev/null 2>&1; then
 				details="$(unzip -Z -l "$asset_file" 2>/dev/null)" || return 1
 				printf '%s\n' "$details" | awk '
 					$1 ~ /^l/ { bad = 1 }
 					END { exit bad }
 				' || return 1
 			elif command -v bsdtar >/dev/null 2>&1; then
-				entries="$(bsdtar -tf "$asset_file" 2>/dev/null)" || return 1
-				printf '%s\n' "$entries" | archive_paths_are_safe || return 1
 				details="$(bsdtar -tvf "$asset_file" 2>/dev/null)" || return 1
 				printf '%s\n' "$details" | awk '
 					{ type = substr($0, 1, 1); if (type != "-" && type != "d") bad = 1 }
 					END { exit bad }
 				' || return 1
-			else
-				# BusyBox unzip cannot list entries without extracting them safely.
-				return 1
 			fi
 		;;
 	esac
@@ -1281,11 +1352,13 @@ validate_asset_file() {
 
 	case "$asset_file" in
 		*.zip)
+			# unzip -t is not a BusyBox unzip option, so list the archive
+			# instead: both implementations support -l.
 			if command -v unzip >/dev/null 2>&1; then
-				unzip -t "$asset_file" >/dev/null 2>&1 && return 0
+				unzip -l "$asset_file" >/dev/null 2>&1 && return 0
 			fi
 			if command -v busybox >/dev/null 2>&1; then
-				busybox unzip -t "$asset_file" >/dev/null 2>&1 && return 0
+				busybox unzip -l "$asset_file" >/dev/null 2>&1 && return 0
 			fi
 			if command -v bsdtar >/dev/null 2>&1; then
 				bsdtar -tf "$asset_file" >/dev/null 2>&1 && return 0
@@ -1321,7 +1394,7 @@ extract_release_asset() {
 	archive_is_safe "$asset_file" || return 1
 
 	rm -rf "$dest_dir"
-	mkdir -p "$dest_dir"
+	secure_cache_dir "$dest_dir" || return 1
 
 	case "$asset_file" in
 		*.tar.gz|*.tgz)
@@ -1372,8 +1445,11 @@ locate_extracted_bin() {
 
 	case "$name" in
 		vnt2_web)
-			find "$root" -type f \( -name "vnt-web" -o -name "vnt_web" -o -name "vnt-web-*" -o -name "vnt_web_*" \) 2>/dev/null | head -n1
-			return 0
+			found="$(find "$root" -type f \( -name "vnt-web" -o -name "vnt_web" -o -name "vnt-web-*" -o -name "vnt_web_*" \) 2>/dev/null | head -n1)"
+			[ -n "$found" ] && {
+				echo "$found"
+				return 0
+			}
 		;;
 	esac
 
@@ -1458,6 +1534,17 @@ cache_bundle_ready() {
 	esac
 }
 
+secure_cache_dir() {
+	local dir="$1"
+
+	mkdir -p "$dir" >/dev/null 2>&1 || return 1
+	# The download cache lives in world-writable /tmp, so keep every
+	# directory root-only: a pre-seeded cache tree would otherwise let a
+	# local user install an arbitrary binary as root.
+	chmod 700 "$dir" >/dev/null 2>&1 || return 1
+	return 0
+}
+
 auto_download_bundle() {
 	local cfg="$1"
 	local scope="$2"
@@ -1467,7 +1554,7 @@ auto_download_bundle() {
 	local mirror_attempt mirror_retry_limit latest_cache_scope
 	local cache_key cache_dir query_dir json_file release_tag asset_url asset_name asset_file extracted_dir
 	local fallback_version fallback_url
-	local web_bin
+	local web_bin cached_asset
 	asset_name=""
 
 	config_get_bool auto_download "$cfg" "auto_download" "1"
@@ -1500,10 +1587,14 @@ auto_download_bundle() {
 	arch_name="$(detect_arch_name)"
 	query_dir="${DOWNLOAD_CACHE_BASE}/query_$(sanitize_name "${cache_mirror_key}_${download_repo}_${download_tag}_${arch_name}_${scope}")"
 	json_file="${query_dir}/release.json"
-	mkdir -p "$query_dir"
+	secure_cache_dir "$query_dir" || {
+		log_download "failed to create query directory ${query_dir}"
+		return 1
+	}
 
 	log_download "query target release repo=${download_repo} tag=${download_tag} arch=${arch_name} scope=${scope}"
-	for candidate_mirror in $(get_download_mirror_candidates "$download_repo" "$download_mirror"); do
+	while IFS= read -r candidate_mirror; do
+		[ -n "$candidate_mirror" ] || continue
 		mirror_retry_limit="$DOWNLOAD_MIRROR_RETRIES"
 		[ "$candidate_mirror" = "custom" ] && mirror_retry_limit=1
 		for mirror_attempt in $(seq 1 "$mirror_retry_limit"); do
@@ -1551,7 +1642,10 @@ EOF
 			cache_key="$(sanitize_name "${cache_mirror_key}_${candidate_mirror}_${download_repo}_${release_tag}_${arch_name}_${scope}")"
 			cache_dir="${DOWNLOAD_CACHE_BASE}/${cache_key}"
 			extracted_dir="${cache_dir}/extracted"
-			mkdir -p "$cache_dir"
+			secure_cache_dir "$cache_dir" || {
+				log_download "failed to create cache directory ${cache_dir}"
+				continue
+			}
 			cp -f "$json_file" "${cache_dir}/release.json" >/dev/null 2>&1
 
 			asset_url="$(select_release_asset "$json_file" "$scope" "$release_tag" "$arch_name")" || {
@@ -1565,13 +1659,20 @@ EOF
 			log_download "selected asset ${asset_name} mirror=${candidate_mirror} url=${asset_url}"
 
 			if cache_bundle_ready "$extracted_dir" "$scope"; then
+				cached_asset="$(select_release_asset "$json_file" "$scope" "$release_tag" "$arch_name" 2>/dev/null || true)"
+				if [ -n "$cached_asset" ]; then
+					cached_asset="$(basename "$cached_asset")"
+				else
+					cached_asset="vnt2_web"
+				fi
 				log_download "cached bundle found for ${scope}, reuse ${extracted_dir} mirror=${candidate_mirror}"
-				write_download_state "$state_file" "cached" "reusing local cached bundle" "$(basename "$cache_dir")" "$release_tag" "$arch_name" "$extracted_dir"
+				write_download_state "$state_file" "cached" "reusing local cached bundle" "$cached_asset" "$release_tag" "$arch_name" "$extracted_dir"
 				if install_bundle_to_usrbin "$extracted_dir" "$scope"; then
-					write_version_state "$release_tag" "download-cache" "$arch_name" "$asset_name" "${INSTALL_BIN_DIR}/vnt2_web" || \
+					write_version_state "$release_tag" "download-cache" "$arch_name" "$cached_asset" "${INSTALL_BIN_DIR}/vnt2_web" || \
 						log_download "failed to persist version state for cached bundle tag=${release_tag}"
 					uci -q set "${CONF}.${cfg}.vnt2_web_bin=${INSTALL_BIN_DIR}/vnt2_web"
 					uci commit "$CONF" >/dev/null 2>&1
+					mark_just_installed
 					return 0
 				fi
 			fi
@@ -1620,13 +1721,16 @@ EOF
 			fi
 			uci -q set "${CONF}.${cfg}.vnt2_web_bin=${INSTALL_BIN_DIR}/vnt2_web"
 			uci commit "$CONF" >/dev/null 2>&1
+			mark_just_installed
 			log_download "web bundle installed: web=${INSTALL_BIN_DIR}/vnt2_web mirror=${candidate_mirror} url=${asset_url}"
 			write_download_state "$state_file" "success" "installed vnt2_web to /usr/bin" "$asset_name" "$release_tag" "$arch_name" "${INSTALL_BIN_DIR}/vnt2_web"
 			write_version_state "$release_tag" "download" "$arch_name" "$asset_name" "${INSTALL_BIN_DIR}/vnt2_web" || \
 				log_download "failed to persist version state tag=${release_tag}"
 			return 0
 		done
-	done
+	done <<EOF
+$(get_download_mirror_candidates "$download_repo" "$download_mirror")
+EOF
 
 	write_download_state "$state_file" "failed" "all download mirrors failed" "${asset_name:-unknown}" "$download_tag" "$arch_name" ""
 	clear_version_state
@@ -1638,9 +1742,8 @@ prepare_binary() {
 	local cfg="$1"
 	local option="$2"
 	local default_path="$3"
-	local upload_name="$4"
-	local state_file="$5"
-	local scope="$6"
+	local state_file="$4"
+	local scope="$5"
 
 	local bin
 	config_get bin "$cfg" "$option" "$default_path"
@@ -1678,6 +1781,63 @@ prepare_binary() {
 		return 0
 	fi
 
+	return 1
+}
+
+# Record that this run installed the binary. A UCI commit triggers a procd
+# reload, and reload_service uses this marker to skip the redundant restart
+# that would otherwise follow the install.
+mark_just_installed() {
+	local marker_tmp="${JUST_INSTALLED_MARKER}.$$"
+
+	if (umask 077; printf '%s\n' "$(date +%s)" >"${marker_tmp}"); then
+		mv -f "${marker_tmp}" "${JUST_INSTALLED_MARKER}" >/dev/null 2>&1 || {
+			rm -f "${marker_tmp}"
+			return 1
+		}
+	else
+		rm -f "${marker_tmp}"
+		return 1
+	fi
+	return 0
+}
+
+# Extra command run by /usr/libexec/vnt2/download-worker when the binary is
+# missing. It performs the slow download outside of the boot and Save&Apply
+# paths and then queues the restart that actually starts the service.
+download_missing_binaries() {
+	local cfg bin enabled
+
+	ensure_log_files
+	config_load "${CONF}"
+	cfg="$(get_first_section_id "vnt2_web")"
+	[ -n "$cfg" ] || {
+		log_download 'download_missing: vnt2_web config section not found'
+		return 1
+	}
+
+	config_get_bool enabled "$cfg" "enabled" "1"
+	if [ "$enabled" != "1" ]; then
+		log_download 'download_missing: vnt2_web not enabled, skip'
+		return 0
+	fi
+
+	config_get bin "$cfg" "vnt2_web_bin" "/usr/bin/vnt2_web"
+	if ensure_elf_exec "$bin"; then
+		log_download "download_missing: vnt2_web already installed at ${bin}"
+		return 0
+	fi
+
+	log_download 'download_missing: vnt2_web missing, start download'
+	if prepare_binary "$cfg" "vnt2_web_bin" "/usr/bin/vnt2_web" "$DOWNLOAD_WEB_STATE" "web" >/dev/null; then
+		mark_just_installed || log_download 'download_missing: failed to record install marker'
+		schedule_restart || log_download 'download_missing: failed to queue restart'
+		log_download 'download_missing: vnt2_web installed, restart queued'
+		return 0
+	fi
+
+	write_download_state "$DOWNLOAD_WEB_STATE" "failed" "background download of vnt2_web failed" "" "" "$(detect_arch_name)" ""
+	log_download 'download_missing: download failed'
 	return 1
 }
 
@@ -1814,9 +1974,15 @@ uci_set_if_changed() {
 	local value="$2"
 	local current
 
+	# An empty value would silently delete the option below.
+	[ -n "$value" ] || return 1
 	current="$(uci -q get "$key" 2>/dev/null)" || current=""
 	[ "$current" = "$value" ] && return 0
-	uci set "${key}=${value}"
+	if ! uci set "${key}=${value}"; then
+		log_download "failed to set uci option ${key}"
+		return 1
+	fi
+	return 0
 }
 
 uci_delete_if_exists() {
@@ -1830,7 +1996,7 @@ configure_network() {
 	local tun_name="$1"
 	local forward_list="$2"
 	local no_nat="$3"
-	local lan_zone wan_zone enable_ip_forward="${no_nat:-0}"
+	local lan_zone wan_zone
 
 	[ -n "$tun_name" ] || tun_name="vnt-tun"
 	lan_zone="$(find_firewall_zone_name "lan" 2>/dev/null || true)"
@@ -1914,9 +2080,18 @@ configure_network() {
 		;;
 	esac
 
-	[ -n "$(uci changes network)" ] && uci commit network && /etc/init.d/network reload >/dev/null 2>&1
-	[ -n "$(uci changes firewall)" ] && uci commit firewall && /etc/init.d/firewall reload >/dev/null 2>&1
-	[ "$enable_ip_forward" = "0" ] || sysctl -w net.ipv4.ip_forward=1 >/dev/null 2>&1
+	if [ -n "$(uci changes network)" ]; then
+		uci commit network
+		/etc/init.d/network reload >/dev/null 2>&1
+	fi
+	if [ -n "$(uci changes firewall)" ]; then
+		uci commit firewall
+		/etc/init.d/firewall reload >/dev/null 2>&1
+	fi
+	# Zone forwarding rules above only take effect with IP forwarding enabled,
+	# regardless of whether NAT/masq is active for the VNT2 zone.
+	sysctl -w net.ipv4.ip_forward=1 >/dev/null 2>&1
+	return 0
 }
 
 cleanup_network() {
@@ -1926,8 +2101,15 @@ cleanup_network() {
 	uci_delete_if_exists firewall.vnt2fwwan
 	uci_delete_if_exists firewall.lanfwvnt2
 	uci_delete_if_exists firewall.wanfwvnt2
-	[ -n "$(uci changes network)" ] && uci commit network && /etc/init.d/network reload >/dev/null 2>&1
-	[ -n "$(uci changes firewall)" ] && uci commit firewall && /etc/init.d/firewall reload >/dev/null 2>&1
+	if [ -n "$(uci changes network)" ]; then
+		uci commit network
+		/etc/init.d/network reload >/dev/null 2>&1
+	fi
+	if [ -n "$(uci changes firewall)" ]; then
+		uci commit firewall
+		/etc/init.d/firewall reload >/dev/null 2>&1
+	fi
+	return 0
 }
 
 ensure_firewall_rule() {
@@ -1973,11 +2155,10 @@ cleanup_web_firewall() {
 prepare_client_network_runtime() {
 	local cfg="$1"
 	local conf_file="$2"
-	local bind_dev="" forward_list="" forward_raw="" tun_name device_mode no_nat
+	local forward_list="" forward_raw="" tun_name device_mode no_nat
 
 	VNT2_FORWARD_LIST=""
 	if [ -n "$cfg" ]; then
-		config_get bind_dev "$cfg" "bind_dev"
 		config_list_foreach "$cfg" vnt2_forward append_forward_item
 		if [ -z "$VNT2_FORWARD_LIST" ]; then
 			config_get forward_raw "$cfg" "vnt2_forward"
@@ -2000,7 +2181,6 @@ prepare_client_network_runtime() {
 	no_nat="$(toml_get_bool "${conf_file}" "no_nat")"
 	[ -n "$no_nat" ] || no_nat="0"
 
-	VNT2_BIND_DEV="${bind_dev}"
 	VNT2_TUN_NAME="${tun_name}"
 	VNT2_DEVICE_MODE="${device_mode}"
 	VNT2_NO_NAT="${no_nat}"
@@ -2036,36 +2216,57 @@ append_forward_items_from_string() {
 
 start_web_instance() {
 	local cfg="$1"
-	local enabled web_bin web_host web_port web_addr web_wan log_level
+	local enabled web_bin web_host web_port web_addr web_wan log_level auto_download
 
 	config_get_bool enabled "$cfg" "enabled" "0"
 	if [ "$enabled" != "1" ]; then
 		log_web 'not enabled, skip start'
+		cleanup_network
 		cleanup_web_firewall
 		return 0
 	fi
 
 	log_web 'start requested'
-	web_bin="$(prepare_binary "$cfg" "vnt2_web_bin" "/usr/bin/vnt2_web" "vnt2_web" "$DOWNLOAD_WEB_STATE" "web")" || {
-		log_web 'start failed: missing executable vnt2_web'
-		return 1
-	}
-
-	config_get web_host "$cfg" "web_host" "0.0.0.0"
-	config_get web_port "$cfg" "web_port" "19099"
-	config_get_bool web_wan "$cfg" "web_wan" "1"
-	config_get log_level "$cfg" "log_level" "info"
-	web_addr="$(format_socket_addr "$web_host" "$web_port")"
 
 	WEB_CONF_FILE="${WEB_CONF_DEFAULT}"
 	if ! ensure_conf_path_ready "${WEB_CONF_FILE}"; then
 		log_web "client config path is not writable: ${WEB_CONF_FILE}"
 		return 1
 	fi
+	# Validate the client config before prepare_binary: downloading the
+	# binary can take minutes and must not delay a config error.
 	if ! toml_validate_client_config "${WEB_CONF_FILE}"; then
 		log_web 'start failed: client TOML validation failed'
 		return 1
 	fi
+
+	web_bin="$(prepare_binary "$cfg" "vnt2_web_bin" "/usr/bin/vnt2_web" "$DOWNLOAD_WEB_STATE" "web")" || {
+		log_web 'start failed: missing executable vnt2_web'
+		# Do not block the boot path with a download: hand the work to the
+		# background download worker instead.
+		config_get_bool auto_download "$cfg" "auto_download" "1"
+		if [ "$auto_download" = "1" ]; then
+			queue_download_missing
+			write_download_state "$DOWNLOAD_WEB_STATE" "pending" "vnt2_web missing, download queued in background" "" "" "$(detect_arch_name)" ""
+			log_web 'missing vnt2_web queued for background download'
+		fi
+		return 1
+	}
+
+	# The binary path comes from UCI and is interpolated into a shell command
+	# line below, so restrict it to a sane absolute path charset.
+	case "$web_bin" in
+		""|*..*|*[!A-Za-z0-9._/-]*|[!/]*)
+			log_web 'start failed: unsafe vnt2_web binary path'
+			return 1
+		;;
+	esac
+
+	config_get web_host "$cfg" "web_host" "0.0.0.0"
+	config_get web_port "$cfg" "web_port" "19099"
+	config_get_bool web_wan "$cfg" "web_wan" "0"
+	config_get log_level "$cfg" "log_level" "info"
+	web_addr="$(format_socket_addr "$web_host" "$web_port")"
 
 	if ! prepare_client_network_runtime "$cfg" "${WEB_CONF_FILE}"; then
 		log_web 'start failed: client network runtime preparation failed'
@@ -2080,12 +2281,24 @@ start_web_instance() {
 
 	configure_web_firewall "$web_host" "$web_port" "$web_wan"
 	log_web "using ${web_bin} on ${web_addr}, conf=${WEB_CONF_FILE}"
+
+	# vnt2_web keeps its web-managed instance files in a "vnt_config"
+	# directory relative to the current working directory. Launch it with
+	# /etc as working directory so the data lands in /etc/vnt_config instead
+	# of the filesystem root. Migrate a legacy /vnt_config directory once.
+	if [ -d /vnt_config ] && [ ! -e /etc/vnt_config ]; then
+		if mv /vnt_config /etc/vnt_config >/dev/null 2>&1; then
+			log_web 'migrated legacy /vnt_config to /etc/vnt_config'
+		fi
+	fi
+
 	procd_open_instance "vnt2_web"
 	procd_set_param env RUST_LOG="$log_level"
-	procd_set_param command /bin/sh -c "exec \"${web_bin}\" --addr \"${web_addr}\" --conf \"${WEB_CONF_FILE}\" >>\"${WEB_LOG}\" 2>&1"
+	procd_set_param command /bin/sh -c "cd /etc || exit 1; exec \"${web_bin}\" --addr \"${web_addr}\" --conf \"${WEB_CONF_FILE}\" >>\"${WEB_LOG}\" 2>&1"
 	procd_set_param stdout 0
-	procd_set_param stderr 0
-	procd_set_param respawn
+	# Keep stderr connected to logread so crashes stay diagnosable.
+	procd_set_param stderr 1
+	procd_set_param respawn 3600 5 5
 	procd_set_param file "${WEB_CONF_FILE}"
 	procd_set_param limits core="unlimited"
 	procd_set_param limits nofile="1048576 1048576"
@@ -2122,12 +2335,41 @@ start_service() {
 	return "$rc"
 }
 
+# Ask the background download worker to fetch a missing binary. The marker is
+# written the same way the upload worker queues a restart: under umask 077 to a
+# private temporary name that is then renamed into place.
+queue_download_missing() {
+	local pending_file="${DOWNLOAD_MISSING_PENDING_FILE:-/tmp/vnt2-download-missing.pending}"
+	local marker_tmp="${pending_file}.$$"
+
+	# Never write through a pre-existing or symlinked temporary path.
+	if [ -e "$marker_tmp" ] || [ -L "$marker_tmp" ]; then
+		log_download "refusing to write download marker through ${marker_tmp}"
+		return 1
+	fi
+	if (umask 077; printf '%s\n' "$(date +%s)" >"${marker_tmp}"); then
+		mv -f "${marker_tmp}" "${pending_file}" >/dev/null 2>&1 || {
+			rm -f "${marker_tmp}"
+			return 1
+		}
+	else
+		rm -f "${marker_tmp}"
+		return 1
+	fi
+	return 0
+}
+
 stop_service() {
 	ensure_log_files
 	log_web 'service stop flow begin'
 	log_download 'service stop flow begin'
 
 	rm -f "${WEB_TIME}"
+	# A manual stop must also drop a queued restart, otherwise the worker
+	# would immediately start the service again.
+	if [ -n "${RESTART_PENDING_FILE:-}" ]; then
+		rm -f "${RESTART_PENDING_FILE}" "${RESTART_PENDING_FILE}."*
+	fi
 	if [ "${VNT2_RESTART_MODE:-}" = "apply" ]; then
 		# Keep the router management path alive while a queued Save & Apply
 		# restart replaces the managed processes. start_service reconciles any
@@ -2142,7 +2384,47 @@ stop_service() {
 	log_download "service stopped"
 }
 
+vnt2_web_is_running() {
+	[ -n "$(pidof vnt2_web 2>/dev/null)" ]
+}
+
 reload_service() {
+	local marker="${JUST_INSTALLED_MARKER:-}"
+	local installed_at now
+
+	# Installing the binary commits UCI, which triggers this reload. The
+	# restart that follows the install already starts the new binary, so skip
+	# the redundant restart inside a short window after the install.
+	if [ -f "$marker" ]; then
+		installed_at="$(sed -n '1p' "$marker" 2>/dev/null | tr -d '[:space:]')"
+		case "$installed_at" in
+			''|*[!0-9]*)
+				rm -f "$marker"
+			;;
+			*)
+				# Strip leading zeros: dash reads "08" as an invalid octal
+				# number in $(( )) and would abort the reload.
+				installed_at="$(printf '%s' "$installed_at" | sed 's/^0*//')"
+				[ -n "$installed_at" ] || installed_at=0
+				now="$(date +%s)"
+				if [ $((now - installed_at)) -lt 120 ]; then
+					rm -f "$marker"
+					return 0
+				fi
+				rm -f "$marker"
+			;;
+		esac
+	fi
+
+	if vnt2_web_is_running 2>/dev/null; then
+		schedule_restart
+		return 0
+	fi
+
+	# A queued restart would be a no-op while nothing is running, so start
+	# the service directly. The marker is still queued so the worker
+	# reconciles the network and firewall state afterwards.
+	start_service >/dev/null 2>&1 || true
 	schedule_restart
 	return 0
 }
@@ -2152,6 +2434,10 @@ schedule_restart() {
 
 	# This path runs inside LuCI/procd reload requests. It must only write a
 	# marker; the separately managed vnt2-worker owns every slow operation.
+	if [ -e "$marker_tmp" ] || [ -L "$marker_tmp" ]; then
+		rm -f "${marker_tmp}"
+		return 1
+	fi
 	if (umask 077; printf '%s\n' "$(date +%s)" >"${marker_tmp}"); then
 		mv -f "${marker_tmp}" "${RESTART_PENDING_FILE}" >/dev/null 2>&1 || {
 			rm -f "${marker_tmp}"

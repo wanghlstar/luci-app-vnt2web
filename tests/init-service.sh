@@ -10,6 +10,8 @@ UPLOAD_WORKER_INIT_SCRIPT="${ROOT_DIR}/luci-app-vnt2web/root/etc/init.d/vnt2-upl
 UPLOAD_WORKER_SCRIPT="${ROOT_DIR}/luci-app-vnt2web/root/usr/libexec/vnt2/upload-worker"
 VERSION_WORKER_INIT_SCRIPT="${ROOT_DIR}/luci-app-vnt2web/root/etc/init.d/vnt2-version-worker"
 VERSION_WORKER_SCRIPT="${ROOT_DIR}/luci-app-vnt2web/root/usr/libexec/vnt2/version-worker"
+DOWNLOAD_WORKER_INIT_SCRIPT="${ROOT_DIR}/luci-app-vnt2web/root/etc/init.d/vnt2-download-worker"
+DOWNLOAD_WORKER_SCRIPT="${ROOT_DIR}/luci-app-vnt2web/root/usr/libexec/vnt2/download-worker"
 PACKAGE_MAKEFILE="${ROOT_DIR}/luci-app-vnt2web/Makefile"
 CBI_SCRIPT="${ROOT_DIR}/luci-app-vnt2web/luasrc/model/cbi/vnt2.lua"
 STATUS_VIEW="${ROOT_DIR}/luci-app-vnt2web/luasrc/view/vnt2/vnt2_status.htm"
@@ -56,6 +58,11 @@ test_reload_only_queues_marker() {
 
 	load_function schedule_restart
 	load_function reload_service
+	# reload_service consults the running Web process and may fall back to a
+	# direct start. Both are owned by other functions, so stub them here to
+	# keep this test focused on the marker it queues.
+	vnt2_web_is_running() { return 1; }
+	start_service() { :; }
 	RESTART_PENDING_FILE="$dir/vnt2-restart.pending"
 	reload_service
 	[ -s "$RESTART_PENDING_FILE" ] || fail "reload did not create the pending marker"
@@ -87,15 +94,27 @@ test_worker_package_lifecycle() {
 	grep -Fq 'CHECK_DELAY="${VNT2_VERSION_DELAY:-2}"' "$VERSION_WORKER_SCRIPT" || fail "version worker debounce is not 2 seconds"
 	grep -Fq '"$CHECK_COMMAND" refresh_latest_versions </dev/null >/dev/null 2>&1' "$VERSION_WORKER_SCRIPT" || \
 		fail "version worker does not detach and invoke the refresh command"
+	grep -Fq 'PROG="/usr/libexec/vnt2/download-worker"' "$DOWNLOAD_WORKER_INIT_SCRIPT" || \
+		fail "download worker init does not launch the download worker"
+	grep -Fq 'procd_set_param stderr 1' "$WORKER_INIT_SCRIPT" || \
+		fail "restart worker init discards crash output on stderr"
+	grep -Fq 'procd_set_param stderr 1' "$UPLOAD_WORKER_INIT_SCRIPT" || \
+		fail "upload worker init discards crash output on stderr"
+	grep -Fq 'procd_set_param stderr 1' "$VERSION_WORKER_INIT_SCRIPT" || \
+		fail "version worker init discards crash output on stderr"
+	grep -Fq 'procd_set_param stdout 0' "$WORKER_INIT_SCRIPT" || \
+		fail "restart worker init changed its stdout redirection"
 
 	for path in \
 		'/etc/init.d/vnt2' \
 		'/etc/init.d/vnt2-upload-worker' \
 		'/etc/init.d/vnt2-worker' \
 		'/etc/init.d/vnt2-version-worker' \
+		'/etc/init.d/vnt2-download-worker' \
 		'/usr/libexec/vnt2/restart-worker' \
 		'/usr/libexec/vnt2/upload-worker' \
-		'/usr/libexec/vnt2/version-worker'
+		'/usr/libexec/vnt2/version-worker' \
+		'/usr/libexec/vnt2/download-worker'
 	do
 		grep -Fq "$path" "$PACKAGE_MAKEFILE" || fail "package lifecycle omits $path"
 	done
@@ -111,6 +130,10 @@ test_worker_package_lifecycle() {
 	grep -Fq '/etc/init.d/vnt2-version-worker restart' "$PACKAGE_MAKEFILE" || fail "postinst does not start the version worker"
 	grep -Fq '/etc/init.d/vnt2-version-worker stop' "$PACKAGE_MAKEFILE" || fail "prerm does not stop the version worker"
 	grep -Fq '/etc/init.d/vnt2-version-worker disable' "$PACKAGE_MAKEFILE" || fail "prerm does not disable the version worker"
+	grep -Fq '/etc/init.d/vnt2-download-worker enable' "$PACKAGE_MAKEFILE" || fail "postinst does not enable the download worker"
+	grep -Fq '/etc/init.d/vnt2-download-worker restart' "$PACKAGE_MAKEFILE" || fail "postinst does not start the download worker"
+	grep -Fq '/etc/init.d/vnt2-download-worker stop' "$PACKAGE_MAKEFILE" || fail "prerm does not stop the download worker"
+	grep -Fq '/etc/init.d/vnt2-download-worker disable' "$PACKAGE_MAKEFILE" || fail "prerm does not disable the download worker"
 
 	printf 'PASS: package installs and manages all workers\n'
 }

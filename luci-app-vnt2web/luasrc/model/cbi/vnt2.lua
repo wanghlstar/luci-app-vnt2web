@@ -1,7 +1,7 @@
-local http = require "luci.http"
 local fs = require "nixio.fs"
 local nixio = require "nixio"
 local util = require "luci.util"
+local xml = require "luci.xml"
 local sys = require "luci.sys"
 local uci = require "luci.model.uci".cursor()
 local dispatcher = require "luci.dispatcher"
@@ -64,134 +64,176 @@ local function render_pre_content(content)
 	if content == "" then
 		content = translate("暂无数据")
 	end
-	return "<pre style='white-space:pre-wrap;word-break:break-all;'>" .. util.pcdata(content) .. "</pre>"
+	return "<pre style='white-space:pre-wrap;word-break:break-all;'>" .. xml.pcdata(content) .. "</pre>"
 end
 
 local function render_pre(path)
 	return render_pre_content(fs.readfile(path) or "")
 end
+
+local UPLOAD_NOTE_FILE = "/tmp/vnt2-upload.note"
+
 -- CBI validators may need values from sibling fields in the same form post.
 local cbi_options = {}
 
+-- Register an option so cross-field validators can read its live form value
+-- through cbi_options in current_option(). Options that take part in
+-- cross-field validation must be registered right after they are created,
+-- e.g. cbi_options.ikev2_enabled = w:taboption("general", Flag, "ikev2_enabled").
+local function register_option(option)
+	if type(option) == "table" and option.option then
+		cbi_options[option.option] = option
+	end
+	return option
+end
 
-local function add_file_upload_handler(note_options)
-	local fd, uploaded_name, staged_path, upload_size, upload_rejected
+-- The LuCI CBI framework installs its own multipart file handler while
+-- loading this model (see cbi.lua load()), which silently replaces any
+-- handler registered here. The framework stages the upload to
+-- /etc/luci-uploads/<cbid> and passes that path to the option write
+-- callback, so staging for the background upload worker happens in
+-- web_upload.write below instead of via http.setfilehandler.
+local function set_upload_note(message)
+	fs.writefile(UPLOAD_NOTE_FILE, tostring(message) .. "\n")
+end
+
+local function write_atomic(path, value)
 	local stat = fs.readfile("/proc/self/stat") or ""
 	local pid = stat:match("^(%d+)") or tostring(os.time())
-
-	local function set_note(message)
-		for _, opt in ipairs(note_options or {}) do
-			opt.value = message
-		end
+	local temp = string.format("%s.%s.%s", path, pid, tostring(os.time()))
+	if not fs.writefile(temp, value) then
+		fs.remove(temp)
+		return false
 	end
-
-	local function write_atomic(path, value)
-		local temp = string.format("%s.%s.%s", path, pid, tostring(os.time()))
-		if not fs.writefile(temp, value) then
-			fs.remove(temp)
-			return false
-		end
-		if not fs.chmod(temp, "0600") then
-			fs.remove(temp)
-			return false
-		end
-		if not os.rename(temp, path) then
-			fs.remove(temp)
-			return false
-		end
-		return true
+	if not fs.chmod(temp, "0600") then
+		fs.remove(temp)
+		return false
 	end
-
-	local function new_staged_path()
-		local base = string.format("%s/incoming.%s.%s", UPLOAD_DIR, pid, tostring(os.time()))
-		local suffix = 0
-		local path = base
-
-		while fs.access(path) do
-			suffix = suffix + 1
-			path = string.format("%s.%s", base, tostring(suffix))
-		end
-		return path
+	if not os.rename(temp, path) then
+		fs.remove(temp)
+		return false
 	end
+	return true
+end
 
-	if fs.mkdirr(UPLOAD_DIR) == nil then
-		fs.mkdirr(UPLOAD_DIR)
+local function detect_upload_kind(path)
+	local fd = nixio.open(path, "r")
+	if not fd then
+		return nil
+	end
+	local chunk = fd:read(4)
+	fd:close()
+	if not chunk or #chunk < 4 then
+		return nil
+	end
+	-- gzip magic: tar.gz bundles produced by the release workflow
+	if chunk:byte(1) == 0x1f and chunk:byte(2) == 0x8b then
+		return "tar.gz"
+	end
+	-- ELF magic: bare vnt2_web binary
+	if chunk:byte(1) == 0x7f and chunk:sub(2, 4) == "ELF" then
+		return "elf"
+	end
+	return nil
+end
+
+local function stage_uploaded_web(staged_path)
+	if not fs.mkdirr(UPLOAD_DIR) then
+		set_upload_note(translate("错误：无法创建上传暂存目录"))
+		return false
 	end
 	fs.chmod(UPLOAD_DIR, "0700")
 
-	http.setfilehandler(function(meta, chunk, eof)
-		if not fd then
-			if not meta then
-				return
-			end
+	local stat = fs.stat(staged_path)
+	if not stat or stat.type ~= "reg" then
+		set_upload_note(translate("错误：上传文件不存在或不是普通文件"))
+		return false
+	end
+	if stat.size > MAX_UPLOAD_SIZE then
+		set_upload_note(translate("错误：上传文件超过 256 MiB 限制"))
+		return false
+	end
 
-			local raw_name = tostring(meta.file or "")
-			uploaded_name = raw_name:match("([^/\\]+)$") or raw_name
-			uploaded_name = uploaded_name:gsub("[\r\n%z]", "")
-			uploaded_name = uploaded_name:gsub("[^%w%._-]", "_")
-			if uploaded_name == "" then
-				return
-			end
+	local kind = detect_upload_kind(staged_path)
+	if not kind then
+		set_upload_note(translate("错误：仅支持 vnt2_web 可执行文件或包含 vnt2_web 的 .tar.gz 压缩包"))
+		return false
+	end
 
-			staged_path = new_staged_path()
-			upload_size = 0
-			upload_rejected = false
-			fd = nixio.open(staged_path, "w")
-			if not fd then
-				set_note(translate("错误：无法创建上传暂存文件"))
-				return
-			end
-		end
+	local pid_stat = fs.readfile("/proc/self/stat") or ""
+	local pid = pid_stat:match("^(%d+)") or tostring(os.time())
+	local suffix = 0
+	local dest = string.format("%s/incoming.%s.%s", UPLOAD_DIR, pid, tostring(os.time()))
+	while fs.access(dest) do
+		suffix = suffix + 1
+		dest = string.format("%s.%s", dest, tostring(suffix))
+	end
 
-		if chunk and fd then
-			upload_size = upload_size + #chunk
-			if upload_size > MAX_UPLOAD_SIZE then
-				upload_rejected = true
-				fd:close()
-				fd = nil
-				fs.remove(staged_path)
-				set_note(translate("错误：上传文件超过 256 MiB 限制"))
-			else
-				fd:write(chunk)
-			end
-		end
+	if not os.rename(staged_path, dest) then
+		set_upload_note(translate("错误：无法移动上传文件到暂存目录"))
+		return false
+	end
+	if not fs.chmod(dest, "0600") then
+		fs.remove(dest)
+		set_upload_note(translate("错误：无法保护上传暂存文件"))
+		return false
+	end
 
-		if eof and fd then
-			fd:close()
-			fd = nil
+	-- The worker decides archive vs. bare binary from the marker name.
+	local marker_name = (kind == "tar.gz") and "vnt2_web.tar.gz" or "vnt2_web"
+	local marker = string.format(
+		"time=%s\npath=%s\nname=%s\nsize=%s\n",
+		tostring(os.time()), dest, marker_name, tostring(stat.size)
+	)
+	if not write_atomic(UPLOAD_PENDING_FILE, marker) then
+		fs.remove(dest)
+		set_upload_note(translate("错误：无法排队后台上传任务"))
+		return false
+	end
 
-			if upload_rejected then
-				return
-			end
-
-			if not fs.chmod(staged_path, "0600") then
-				fs.remove(staged_path)
-				set_note(translate("错误：无法保护上传暂存文件"))
-				return
-			end
-
-			local marker = string.format(
-				"time=%s\npath=%s\nname=%s\nsize=%s\n",
-				tostring(os.time()),
-				staged_path,
-				uploaded_name,
-				tostring(upload_size or 0)
-			)
-			if not write_atomic(UPLOAD_PENDING_FILE, marker) then
-				fs.remove(staged_path)
-				set_note(translate("错误：无法排队后台上传任务"))
-				return
-			end
-
-			set_note(translate("上传文件已接收并进入后台处理队列，请查看下载日志获取安装结果。"))
-		end
-	end)
+	set_upload_note(translate("上传文件已接收并进入后台处理队列，请查看下载日志获取安装结果。"))
+	return true
 end
+
+
 
 local function validate_nonempty(self, value)
 	value = trim(value)
 	if value == "" then
 		return nil, translate("该字段不能为空")
+	end
+	return value
+end
+
+local function validate_download_tag(self, value)
+	value = trim(value)
+	if value == "" then
+		return nil, translate("该字段不能为空")
+	end
+	if not value:match("^[A-Za-z0-9._-]+$") then
+		return nil, translate("下载版本只能包含字母、数字、点、下划线和短横线，例如 latest 或 v2.0.18")
+	end
+	return value
+end
+
+local function validate_download_repo(self, value)
+	value = trim(value)
+	if value == "" then
+		return nil, translate("该字段不能为空")
+	end
+	if not value:match("^[A-Za-z0-9._-]+/[A-Za-z0-9._-]+$") then
+		return nil, translate("下载仓库格式错误，应为 用户名/仓库名，例如 vnt-dev/vnt")
+	end
+	return value
+end
+
+local function validate_web_bin_path(self, value)
+	value = trim(value)
+	if value == "" then
+		return nil, translate("该字段不能为空")
+	end
+	if not value:match("^/[A-Za-z0-9._/-]+$") or value:find("..", 1, true) then
+		return nil, translate("程序路径必须以 / 开头，只能包含字母、数字、点、下划线、短横线和斜杠，且不能包含 ..")
 	end
 	return value
 end
@@ -524,6 +566,25 @@ local function validate_ipv4_item(self, value)
 	return nil, translate("请输入 IPv4 地址")
 end
 
+-- Read the live form value of a sibling option from the same section.
+-- Map.formvalue() expects the full form field key, which is exactly what
+-- AbstractValue.cbid() builds: "cbid.<config>.<section>.<option>".
+local function sibling_formvalue(self, option)
+	if not self.map or type(self.map.formvalue) ~= "function" then
+		return nil
+	end
+
+	local key = string.format(
+		"cbid.%s.%s.%s",
+		tostring(self.map.config), tostring(self.section), tostring(option)
+	)
+	local ok, result = pcall(self.map.formvalue, self.map, key)
+	if ok then
+		return result
+	end
+	return nil
+end
+
 local function current_option(self, option)
 	local value
 	local option_object = cbi_options[option]
@@ -533,13 +594,8 @@ local function current_option(self, option)
 			value = result
 		end
 	end
-	if self.map and type(self.map.formvalue) == "function" then
-		if value == nil then
-			local ok, result = pcall(self.map.formvalue, self.map, self.section, option)
-			if ok then
-				value = result
-			end
-		end
+	if value == nil then
+		value = sibling_formvalue(self, option)
 	end
 	if type(value) == "table" then
 		value = value[1]
@@ -928,9 +984,6 @@ local function bind_custom_download_mirror(option, mirror_option)
 	end
 end
 
-local web_enabled_state = m.uci:get_first("vnt2", "vnt2_web", "enabled") == "1"
-local web_running = web_enabled_state and process_running("vnt2_web")
-
 -- ==================== vnt2_web ====================
 ;(function()
 local w = m:section(TypedSection, "vnt2_web", translate("vnt2_web 客户端设置"))
@@ -945,7 +998,7 @@ local web_enabled = w:taboption("general", Flag, "enabled", translate("启用web
 web_enabled.rmempty = false
 web_enabled.default = "0"
 web_enabled.write = function(self, section, value)
-	self.map.uci:set(self.map.config, section, self.option, value)
+	return AbstractValue.write(self, section, value)
 end
 
 local web_restart = w:taboption("general", Button, "_restart_web", translate("重启客户端"))
@@ -978,18 +1031,18 @@ local download_tag_web = w:taboption("advanced", Value, "download_tag", translat
 	translate("填写 latest 表示始终获取最新版本，也可填写指定 Release 标签，如 v2.0.18"))
 download_tag_web.placeholder = "latest"
 download_tag_web.default = "latest"
-download_tag_web.validate = validate_nonempty
+download_tag_web.validate = validate_download_tag
 
 local download_repo_web = w:taboption("advanced", Value, "download_repo", translate("Web 下载仓库"),
 	translate("默认 vnt-dev/vnt；如需使用 Gitee、GitLab、Cloudflare 等镜像，建议保持默认仓库"))
 download_repo_web.placeholder = "vnt-dev/vnt"
 download_repo_web.default = "vnt-dev/vnt"
-download_repo_web.validate = validate_nonempty
+download_repo_web.validate = validate_download_repo
 
 local vnt2_web_bin = w:taboption("general", Value, "vnt2_web_bin", translate("vnt2_web 程序路径"),
 	translate("默认 /usr/bin/vnt2_web；若不存在，将优先尝试自动下载，失败后回退到已上传并安装到 /usr/bin 的程序"))
 vnt2_web_bin.placeholder = "/usr/bin/vnt2_web"
-vnt2_web_bin.validate = validate_nonempty
+vnt2_web_bin.validate = validate_web_bin_path
 
 local web_host = w:taboption("general", Value, "web_host", translate("监听地址"),
 	translate("默认监听 0.0.0.0，允许局域网或其他外部设备访问；如需限制仅本机访问，可改为 127.0.0.1"))
@@ -999,12 +1052,12 @@ web_host.datatype = "ipaddr"
 
 local web_port = w:taboption("general", Value, "web_port", translate("监听端口"))
 web_port.placeholder = "19099"
-web_port.datatype = "port"
+web_port.datatype = "range(1,65535)"
 
 local web_wan = w:taboption("general", Flag, "web_wan", translate("允许 WAN 访问"),
-	translate("默认启用；当监听地址为 0.0.0.0 或 :: 时会自动创建 WAN 放行规则"))
+	translate("默认关闭；开启后当监听地址为 0.0.0.0 或 :: 时会自动创建 WAN 放行规则，请务必先设置复杂的访问令牌"))
 web_wan.rmempty = false
-web_wan.default = "1"
+web_wan.default = "0"
 
 local open_web = w:taboption("general", DummyValue, "_open_web", translate("打开 Web 页面"),
 	translate("打开当前配置对应的 Web 管理页面，默认地址通常为 http://路由器IP:19099/"))
@@ -1012,8 +1065,8 @@ open_web.rawhtml = true
 open_web.cfgvalue = function()
 	return string.format(
 		'<a class="btn cbi-button cbi-button-apply" href="%s" target="_blank" rel="noopener noreferrer">%s</a>',
-		util.pcdata(dispatcher.build_url("admin", "vpn", "vnt2", "open_web")),
-		util.pcdata(translate("打开 Web 页面"))
+		xml.pcdata(dispatcher.build_url("admin", "vpn", "vnt2", "open_web")),
+		xml.pcdata(translate("打开 Web 页面"))
 	)
 end
 
@@ -1036,11 +1089,15 @@ local web_cmd = w:taboption("advanced", Button, "_web_cmd", translate("读取 We
 web_cmd.inputtitle = translate("刷新")
 web_cmd.inputstyle = "apply"
 web_cmd.write = function()
-	if web_running then
-		sys.call("tr '\\000' ' ' </proc/$(pidof vnt2_web | awk '{print $1}')/cmdline >/tmp/vnt2-web_cmd 2>/dev/null")
+	local running = process_running("vnt2_web")
+	local command
+	if running then
+		command = "tr '\\000' ' ' </proc/$(pidof vnt2_web | awk '{print $1}')/cmdline"
 	else
-		sys.call("echo '错误：程序未运行！请先启动 vnt2_web。' >/tmp/vnt2-web_cmd")
+		command = "echo '错误：程序未运行！请先启动 vnt2_web。'"
 	end
+	sys.call(string.format("umask 077 && %s >/tmp/vnt2-web_cmd 2>/dev/null", command))
+	fs.chmod("/tmp/vnt2-web_cmd", "0600")
 end
 
 local web_cmd_content = w:taboption("advanced", DummyValue, "_web_cmd_content")
@@ -1055,15 +1112,33 @@ web_upload.default = ""
 web_upload.template = "vnt2/other_upload"
 web_upload.description = translate("支持上传 vnt2_web 二进制文件或包含 vnt2_web 的 .tar.gz 压缩包；文件会先暂存，再由后台上传 worker 校验并安装到 /usr/bin/；当自动下载失败时，系统会回退使用已经安装的有效程序。")
 
+-- The CBI framework stages the multipart upload and passes the temporary
+-- file path as the written value. Stage it for the background worker here.
+web_upload.write = function(self, section, value)
+	value = trim(value)
+	if value == "" or not fs.access(value) then
+		return nil
+	end
+	local ok = pcall(stage_uploaded_web, value)
+	if not ok then
+		set_upload_note(translate("错误：处理上传时发生异常，请查看系统日志"))
+	end
+	return nil
+end
+
 local web_upload_note = w:taboption("upload", DummyValue, "_upload_note_web")
 web_upload_note.rawhtml = true
 web_upload_note.template = "vnt2/other_dvalue"
-cbi_options.web_upload_note = web_upload_note
+web_upload_note.cfgvalue = function()
+	return fs.readfile(UPLOAD_NOTE_FILE) or ""
+end
+
+-- Register the options of this section so cross-field validators can read the
+-- live form values of their siblings through cbi_options in current_option().
+for _, option in pairs(w.fields) do
+	register_option(option)
+end
 end)()
 
-
-add_file_upload_handler({
-	cbi_options.web_upload_note
-})
 
 return m

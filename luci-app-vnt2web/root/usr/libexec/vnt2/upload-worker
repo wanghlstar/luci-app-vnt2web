@@ -11,13 +11,42 @@ INSTALL_BIN_DIR="${VNT2_INSTALL_BIN_DIR:-/usr/bin}"
 TARGET_BIN="${INSTALL_BIN_DIR}/vnt2_web"
 POLL_INTERVAL="${VNT2_UPLOAD_POLL_INTERVAL:-1}"
 UCI_COMMAND="${VNT2_UCI_COMMAND:-uci}"
+TARGET_ARCH=""
+INSTALL_ELF_ARCH=""
 
 normalize_text() {
 	printf '%s' "$1" | tr -d '\r\n\000'
 }
 
 log_worker() {
-	printf '%s download : %s\n' "$(date '+%Y-%m-%d %H:%M:%S')" "$(normalize_text "$*")" >>"${DOWNLOAD_LOG}"
+	printf '%s upload : %s\n' "$(date '+%Y-%m-%d %H:%M:%S')" "$(normalize_text "$*")" >>"${DOWNLOAD_LOG}"
+}
+
+normalize_seconds() {
+	local value="$1"
+	local fallback="$2"
+
+	case "$value" in
+		''|*[!0-9]*)
+			printf '%s\n' "$fallback"
+			return 0
+		;;
+	esac
+	# Strip leading zeros: dash evaluates "08" as an invalid octal number.
+	value="$(printf '%s' "$value" | sed 's/^0*//')"
+	[ -n "$value" ] || value=0
+	printf '%s\n' "$value"
+}
+
+file_mtime() {
+	local value
+
+	value="$(stat -c '%Y' "$1" 2>/dev/null || true)"
+	[ -n "$value" ] || value="$(stat -f '%m' "$1" 2>/dev/null || true)"
+	case "$value" in
+		''|*[!0-9]*) return 1 ;;
+	esac
+	printf '%s\n' "$value"
 }
 
 write_state() {
@@ -71,6 +100,56 @@ is_elf_binary() {
 	[ "$magic" = "7f454c46" ]
 }
 
+# Prints the architecture an ELF file was built for. e_machine lives at byte
+# offset 18 and is stored in the file's endianness (EI_DATA, offset 5). An
+# architecture without a known mapping is rejected instead of installed,
+# because a foreign binary only fails once the service tries to run it.
+elf_arch_name() {
+	local bin="$1"
+	local machine_bytes data_byte lo hi
+
+	machine_bytes="$(od -An -tx1 -j18 -N2 "$bin" 2>/dev/null | tr -d '[:space:]')"
+	case "$machine_bytes" in
+		[0-9a-f][0-9a-f][0-9a-f][0-9a-f]) ;;
+		*) return 1 ;;
+	esac
+	data_byte="$(od -An -tx1 -j5 -N1 "$bin" 2>/dev/null | tr -d '[:space:]')"
+	lo="${machine_bytes%??}"
+	hi="${machine_bytes#??}"
+	case "$data_byte" in
+		01) ;;
+		02)
+			lo="${machine_bytes#??}"
+			hi="${machine_bytes%??}"
+		;;
+		*) return 1 ;;
+	esac
+	case "$hi$lo" in
+		003e) echo "x86_64" ;;
+		00b7) echo "aarch64" ;;
+		0028) echo "arm" ;;
+		0008) echo "mips" ;;
+		00f3) echo "riscv" ;;
+		0003) echo "x86" ;;
+		*) return 1 ;;
+	esac
+}
+
+elf_arch_matches() {
+	local elf_arch="$1"
+	local wanted="$2"
+
+	case "$wanted" in
+		x86_64|amd64) [ "$elf_arch" = "x86_64" ] ;;
+		aarch64|arm64) [ "$elf_arch" = "aarch64" ] ;;
+		x86|i386|i486|i586|i686) [ "$elf_arch" = "x86" ] ;;
+		arm*) [ "$elf_arch" = "arm" ] ;;
+		mips*) [ "$elf_arch" = "mips" ] ;;
+		riscv*) [ "$elf_arch" = "riscv" ] ;;
+		*) return 1 ;;
+	esac
+}
+
 detect_arch_name() {
 	local mach
 	mach="$(uname -m 2>/dev/null)"
@@ -104,13 +183,20 @@ END { exit bad }
 
 archive_is_safe() {
 	local archive="$1"
-	local entries details
+	local format="${2:-gz}"
+	local entries details compress_flag
+
+	case "$format" in
+		gz) compress_flag="z" ;;
+		xz) compress_flag="J" ;;
+		*) return 1 ;;
+	esac
 
 	# The caller decides whether the upload is an archive, so the staged file
 	# name (incoming.*) must not be used to guess the container format.
-	entries="$(tar -tzf "$archive" 2>/dev/null)" || return 1
+	entries="$(tar -t${compress_flag}f "$archive" 2>/dev/null)" || return 1
 	printf '%s\n' "$entries" | archive_paths_are_safe || return 1
-	details="$(tar -tvzf "$archive" 2>/dev/null)" || return 1
+	details="$(tar -tv${compress_flag}f "$archive" 2>/dev/null)" || return 1
 	printf '%s\n' "$details" | awk '
 		{ type = substr($0, 1, 1); if (type != "-" && type != "d") bad = 1 }
 		END { exit bad }
@@ -121,14 +207,23 @@ archive_is_safe() {
 locate_extracted_bin() {
 	local root="$1"
 	local name="$2"
-	local alt_dash alt_under found
+	local alt_dash alt_under exact found
 
 	alt_dash="$(printf '%s' "$name" | tr '_' '-')"
 	alt_under="$(printf '%s' "$name" | tr '-' '_')"
+	# find walks directories in filesystem order, so sort before picking one.
+	# An exact name match always wins over the alternative spellings.
+	exact="$(
+		find "$root" -type f -name "$name" 2>/dev/null |
+		LC_ALL=C sort | head -n1
+	)"
+	[ -n "$exact" ] && {
+		echo "$exact"
+		return 0
+	}
 	found="$(
 		find "$root" -type f \
 			\( \
-				-name "$name" -o \
 				-name "${name}.bin" -o \
 				-name "$alt_dash" -o \
 				-name "${alt_dash}.bin" -o \
@@ -136,7 +231,7 @@ locate_extracted_bin() {
 				-name "${alt_under}.bin" -o \
 				-name "${name}-*" -o \
 				-name "${name}_*" \
-			\) 2>/dev/null | head -n1
+			\) 2>/dev/null | LC_ALL=C sort | head -n1
 	)"
 	[ -n "$found" ] && {
 		echo "$found"
@@ -145,12 +240,40 @@ locate_extracted_bin() {
 	return 1
 }
 
+report_install_failure() {
+	local asset="$1"
+	local subject="$2"
+	local arch="$3"
+
+	if [ "$INSTALL_ELF_ARCH" = "unknown" ]; then
+		log_worker "upload rejected: ${subject} has an unrecognized ELF architecture"
+		write_state "failed" "upload rejected: ${subject} has an unrecognized ELF architecture" "$asset" "" "$arch" ""
+	elif [ -n "$INSTALL_ELF_ARCH" ]; then
+		log_worker "upload rejected: ${subject} targets ${INSTALL_ELF_ARCH} but this router is ${arch}"
+		write_state "failed" "upload rejected: ${subject} targets ${INSTALL_ELF_ARCH} but this router is ${arch}" "$asset" "" "$arch" ""
+	else
+		log_worker "upload failed: ${subject} is not a valid ELF binary"
+		write_state "failed" "upload failed: ${subject} is not a valid ELF binary" "$asset" "" "$arch" ""
+	fi
+}
+
 install_binary_atomic() {
 	local src="$1"
 	local temp_path="${TARGET_BIN}.$$"
+	local elf_arch
 
+	INSTALL_ELF_ARCH=""
 	[ -f "$src" ] || return 1
 	is_elf_binary "$src" || return 1
+	elf_arch="$(elf_arch_name "$src" 2>/dev/null || true)"
+	if [ -z "$elf_arch" ]; then
+		INSTALL_ELF_ARCH="unknown"
+		return 2
+	fi
+	INSTALL_ELF_ARCH="$elf_arch"
+	if [ -n "$TARGET_ARCH" ] && ! elf_arch_matches "$elf_arch" "$TARGET_ARCH"; then
+		return 2
+	fi
 	mkdir -p "$INSTALL_BIN_DIR" >/dev/null 2>&1 || return 1
 	rm -f "$temp_path" >/dev/null 2>&1
 	cp -f "$src" "$temp_path" >/dev/null 2>&1 || {
@@ -205,27 +328,50 @@ queue_restart() {
 }
 
 cleanup_stale_workdirs() {
-	local path
+	local path now mtime age
 
 	[ -d "$UPLOAD_DIR" ] || return 0
 	for path in "$UPLOAD_DIR"/work.*; do
 		[ -d "$path" ] || continue
+		# The directory name carries the instance id, so a second worker
+		# instance must never delete the working set of a running one.
+		case "$path" in
+			"$UPLOAD_DIR/work.$$."*) continue ;;
+		esac
 		rm -rf "$path" >/dev/null 2>&1
+	done
+	# /etc/vnt2 survives reboots, so abandoned staged uploads must not pile up.
+	now="$(date +%s)"
+	for path in "$UPLOAD_DIR"/incoming.*; do
+		[ -f "$path" ] || continue
+		mtime="$(file_mtime "$path" || true)"
+		[ -n "$mtime" ] || continue
+		age=$((now - mtime))
+		[ "$age" -gt 3600 ] || continue
+		rm -f "$path" >/dev/null 2>&1
 	done
 }
 
 process_claimed() {
-	local upload_path upload_name upload_asset work_dir source_bin rc=1 arch
+	local upload_path upload_name upload_asset work_dir source_bin rc=1 arch install_rc
 
 	[ -f "$CLAIMED_FILE" ] || return 0
 	upload_path="$(read_marker_field "$CLAIMED_FILE" path)"
 	upload_name="$(read_marker_field "$CLAIMED_FILE" name)"
 	upload_asset="$(basename "${upload_name:-vnt2_web}")"
 	arch="$(detect_arch_name)"
+	TARGET_ARCH="$arch"
 
 	case "$upload_path" in
 		"${UPLOAD_DIR}/incoming."*) ;;
 		*)
+			log_worker "upload rejected: invalid staged path"
+			write_state "failed" "upload rejected: invalid staged path" "$upload_asset" "" "$arch" ""
+			return 1
+		;;
+	esac
+	case "$upload_path" in
+		*..*)
 			log_worker "upload rejected: invalid staged path"
 			write_state "failed" "upload rejected: invalid staged path" "$upload_asset" "" "$arch" ""
 			return 1
@@ -239,7 +385,7 @@ process_claimed() {
 
 	write_state "processing" "uploaded archive is being validated and installed" "$upload_asset" "" "$arch" ""
 	log_worker "upload worker starts processing asset=${upload_asset}"
-	work_dir="${UPLOAD_DIR}/work.$$"
+	work_dir="${UPLOAD_DIR}/work.$$.$(date +%s)"
 	rm -rf "$work_dir" >/dev/null 2>&1
 	if ! mkdir -p "$work_dir" >/dev/null 2>&1; then
 		log_worker "upload failed: unable to create work directory"
@@ -269,20 +415,53 @@ process_claimed() {
 				log_worker "upload rejected: archive does not contain vnt2_web"
 				write_state "failed" "upload rejected: archive does not contain vnt2_web" "$upload_asset" "" "$arch" ""
 				rc=1
-			elif install_binary_atomic "$source_bin"; then
-				rc=0
 			else
-				log_worker "upload failed: extracted vnt2_web is not a valid ELF binary"
-				write_state "failed" "upload failed: extracted vnt2_web is not a valid ELF binary" "$upload_asset" "" "$arch" ""
-				rc=1
+				install_binary_atomic "$source_bin"
+				install_rc=$?
+				if [ "$install_rc" -eq 0 ]; then
+					rc=0
+				else
+					report_install_failure "$upload_asset" "extracted vnt2_web" "$arch"
+					rc=1
+				fi
 			fi
 		;;
+		*.tar.xz|*.txz)
+			if ! archive_is_safe "$upload_path" xz; then
+				log_worker "upload rejected: unsafe or invalid tar.xz archive"
+				write_state "failed" "upload rejected: unsafe or invalid tar.xz archive" "$upload_asset" "" "$arch" ""
+				rc=1
+			elif ! tar -xJf "$upload_path" -C "$work_dir" >/dev/null 2>&1; then
+				log_worker "upload rejected: archive extraction failed"
+				write_state "failed" "upload rejected: archive extraction failed" "$upload_asset" "" "$arch" ""
+				rc=1
+			elif ! source_bin="$(locate_extracted_bin "$work_dir" "vnt2_web")"; then
+				log_worker "upload rejected: archive does not contain vnt2_web"
+				write_state "failed" "upload rejected: archive does not contain vnt2_web" "$upload_asset" "" "$arch" ""
+				rc=1
+			else
+				install_binary_atomic "$source_bin"
+				install_rc=$?
+				if [ "$install_rc" -eq 0 ]; then
+					rc=0
+				else
+					report_install_failure "$upload_asset" "extracted vnt2_web" "$arch"
+					rc=1
+				fi
+			fi
+		;;
+		*.zip)
+			log_worker "upload rejected: zip archives are not supported, upload tar.gz, tar.xz or a raw binary"
+			write_state "failed" "upload rejected: zip archives are not supported, upload tar.gz, tar.xz or a raw binary" "$upload_asset" "" "$arch" ""
+			rc=1
+		;;
 		*)
-			if install_binary_atomic "$upload_path"; then
+			install_binary_atomic "$upload_path"
+			install_rc=$?
+			if [ "$install_rc" -eq 0 ]; then
 				rc=0
 			else
-				log_worker "upload failed: uploaded file is not a valid ELF binary"
-				write_state "failed" "upload failed: uploaded file is not a valid ELF binary" "$upload_asset" "" "$arch" ""
+				report_install_failure "$upload_asset" "uploaded file" "$arch"
 				rc=1
 			fi
 		;;
@@ -290,7 +469,9 @@ process_claimed() {
 
 	if [ "$rc" -eq 0 ]; then
 		clear_version_state
-		sync_uci_binary_path
+		if ! sync_uci_binary_path; then
+			log_worker "upload warning: failed to sync uci binary path to ${TARGET_BIN}"
+		fi
 		write_state "success" "uploaded binary installed to /usr/bin" "$upload_asset" "" "$arch" "$TARGET_BIN"
 		if queue_restart; then
 			log_worker "upload worker installed asset=${upload_asset} target=${TARGET_BIN} restart_queued=1"
@@ -312,6 +493,7 @@ claim_pending() {
 }
 
 trap 'exit 0' INT TERM
+POLL_INTERVAL="$(normalize_seconds "$POLL_INTERVAL" 1)"
 cleanup_stale_workdirs
 
 while :; do

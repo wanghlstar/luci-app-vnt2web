@@ -6,9 +6,50 @@ DOWNLOAD_LOG="${VNT2_VERSION_LOG_FILE:-/tmp/vnt2-download.log}"
 CHECK_COMMAND="${VNT2_VERSION_CHECK_COMMAND:-/etc/init.d/vnt2}"
 CHECK_DELAY="${VNT2_VERSION_DELAY:-2}"
 POLL_INTERVAL="${VNT2_VERSION_POLL_INTERVAL:-1}"
+RETRY_BACKOFF="${VNT2_VERSION_RETRY_BACKOFF:-5 10 20}"
+RETRY_LIMIT="${VNT2_VERSION_RETRY_LIMIT:-3}"
+
+normalize_seconds() {
+	local value fallback
+
+	value="$1"
+	fallback="$2"
+
+	case "$value" in
+		''|*[!0-9]*)
+			printf '%s\n' "$fallback"
+			return 0
+		;;
+	esac
+	# Strip leading zeros: dash evaluates "08" as an invalid octal number.
+	value="$(printf '%s' "$value" | sed 's/^0*//')"
+	[ -n "$value" ] || value=0
+	printf '%s\n' "$value"
+}
+
+# Every entry is handed to sleep, so a non numeric value has to be dropped
+# instead of being passed through.
+normalize_backoff() {
+	local value fallback entry result
+
+	value="$1"
+	fallback="$2"
+	result=""
+
+	for entry in $value; do
+		case "$entry" in
+			''|*[!0-9]*) continue ;;
+		esac
+		entry="$(printf '%s' "$entry" | sed 's/^0*//')"
+		[ -n "$entry" ] || entry=0
+		result="${result}${result:+ }${entry}"
+	done
+	[ -n "$result" ] || result="$fallback"
+	printf '%s\n' "$result"
+}
 
 log_worker() {
-	printf '%s download : %s\n' "$(date '+%Y-%m-%d %H:%M:%S')" "$*" >>"${DOWNLOAD_LOG}"
+	printf '%s version : %s\n' "$(date '+%Y-%m-%d %H:%M:%S')" "$(printf '%s' "$*" | tr -d '\r\n\000')" >>"${DOWNLOAD_LOG}"
 }
 
 read_request_time() {
@@ -17,8 +58,45 @@ read_request_time() {
 	request_time="$(sed -n '1p' "$1" 2>/dev/null)"
 	case "$request_time" in
 		''|*[!0-9]*) request_time="$(date +%s)" ;;
+		*)
+			# Strip leading zeros: dash evaluates "08" as an invalid octal
+			# number in $(( )) and would abort the whole worker loop.
+			request_time="$(printf '%s' "$request_time" | sed 's/^0*//')"
+			[ -n "$request_time" ] || request_time=0
+		;;
 	esac
 	printf '%s\n' "$request_time"
+}
+
+# The claimed marker keeps its retry counter on the second line so a respawned
+# worker does not have to trust state outside of the request it is processing.
+read_retry_count() {
+	local count
+
+	count="$(sed -n '2p' "$1" 2>/dev/null)"
+	case "$count" in
+		''|*[!0-9]*) count=0 ;;
+		*)
+			count="$(printf '%s' "$count" | sed 's/^0*//')"
+			[ -n "$count" ] || count=0
+		;;
+	esac
+	printf '%s\n' "$count"
+}
+
+write_retry_count() {
+	local file count request_time temp
+
+	file="$1"
+	count="$2"
+	request_time="$(read_request_time "$file")"
+	temp="${file}.retry.$$"
+
+	if (umask 077; printf '%s\n%s\n' "$request_time" "$count" >"$temp"); then
+		mv -f "$temp" "$file" >/dev/null 2>&1 && return 0
+	fi
+	rm -f "$temp" >/dev/null 2>&1
+	return 1
 }
 
 claim_latest_request() {
@@ -40,7 +118,35 @@ run_check() {
 	return "$rc"
 }
 
+# A failed check must not drop the request: the claimed marker survives and the
+# command is retried with a growing backoff before it is abandoned.
+run_check_with_retry() {
+	retries=0
+	set -- $RETRY_BACKOFF
+
+	while :; do
+		if run_check; then
+			return 0
+		fi
+		if [ "$retries" -ge "$RETRY_LIMIT" ] || [ "$#" -eq 0 ]; then
+			log_worker "version worker latest release check abandoned after ${retries} retries"
+			return 1
+		fi
+		retries=$((retries + 1))
+		backoff="$1"
+		shift
+		write_retry_count "$CLAIMED_FILE" "$retries" >/dev/null 2>&1 || true
+		log_worker "version worker latest release check retry ${retries} scheduled in ${backoff}s"
+		sleep "$backoff"
+	done
+}
+
 trap 'exit 0' INT TERM
+
+CHECK_DELAY="$(normalize_seconds "$CHECK_DELAY" 2)"
+POLL_INTERVAL="$(normalize_seconds "$POLL_INTERVAL" 1)"
+RETRY_LIMIT="$(normalize_seconds "$RETRY_LIMIT" 3)"
+RETRY_BACKOFF="$(normalize_backoff "$RETRY_BACKOFF" "5 10 20")"
 
 while :; do
 	if [ ! -f "$CLAIMED_FILE" ]; then
@@ -53,6 +159,8 @@ while :; do
 	request_time="$(read_request_time "$CLAIMED_FILE")"
 	now="$(date +%s)"
 	age=$((now - request_time))
+	# A marker stamped in the future must run immediately, not wait forever.
+	[ "$age" -lt 0 ] && age=0
 	if [ "$age" -le "$CHECK_DELAY" ]; then
 		sleep "$POLL_INTERVAL"
 		continue
@@ -63,6 +171,6 @@ while :; do
 		continue
 	fi
 
-	run_check
+	run_check_with_retry
 	rm -f "$CLAIMED_FILE"
 done

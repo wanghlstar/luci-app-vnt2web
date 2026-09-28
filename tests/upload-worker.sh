@@ -10,15 +10,60 @@ fail() {
 	exit 1
 }
 
+# GNU tar rewrites archived member names with --transform, while bsdtar uses -s
+# and takes the substitution delimiter as the first character of the pattern.
+# Developers run these tests on macOS and CI runs on Ubuntu, so both dialects
+# have to work; a silently skipped tar command would drop the whole check.
+tar_rewrite_args() {
+	if tar --version 2>/dev/null | grep -q 'GNU tar'; then
+		TAR_REWRITE_ARGS="--transform=s|$1|$2|"
+	else
+		TAR_REWRITE_ARGS="-s |$1|$2|"
+	fi
+}
+
+# e_machine values for the architectures the worker can identify, written as
+# printf escapes so the NUL bytes never have to pass through a variable.
+host_elf_machine() {
+	case "$(uname -m 2>/dev/null)" in
+		x86_64|amd64) printf '%s' '\076\000' ;;
+		i386|i486|i586|i686) printf '%s' '\003\000' ;;
+		aarch64|arm64) printf '%s' '\267\000' ;;
+		armv7*|armv6*|arm*) printf '%s' '\050\000' ;;
+		mips*) printf '%s' '\010\000' ;;
+		riscv64*|riscv*) printf '%s' '\363\000' ;;
+		*) return 1 ;;
+	esac
+}
+
+foreign_elf_machine() {
+	case "$(uname -m 2>/dev/null)" in
+		x86_64|amd64|i386|i486|i586|i686) printf '%s' '\267\000' ;;
+		*) printf '%s' '\076\000' ;;
+	esac
+}
+
+# Writes a minimal but complete 20 byte ELF header. The worker validates the
+# e_machine field against the router architecture, so a magic-only fixture is
+# no longer enough.
+make_elf() {
+	path="$1"
+	machine="${2:-}"
+
+	if [ -z "$machine" ]; then
+		machine="$(host_elf_machine)" || return 1
+	fi
+	printf '\177ELF\002\001\001\000' >"$path"
+	printf '\000\000\000\000\000\000\000\000' >>"$path"
+	printf '\002\000' >>"$path"
+	printf '%b' "$machine" >>"$path"
+}
+
 stop_worker() {
 	if [ -f "$1/pid" ]; then
 		kill "$(cat "$1/pid")" 2>/dev/null || true
 		wait "$(cat "$1/pid")" 2>/dev/null || true
 	fi
-}
-
-make_elf() {
-	printf '\177ELF\002\001\001\000' >"$1"
 }
 
 start_worker() {
@@ -110,12 +155,14 @@ test_worker_installs_only_valid_uploads() {
 	[ ! -d "$dir/upload/work.stale" ] || fail "stale work directory was not cleaned up"
 
 	# A marker that points outside the staging directory must be rejected.
-	cat >"$dir/upload.pending" <<EOF
+	# LuCI writes the marker with an atomic rename, so mirror that here.
+	cat >"$dir/upload.pending.tmp" <<EOF
 time=$(date +%s)
 path=/tmp/evil-vnt2_web
 name=vnt2_web
 size=7
 EOF
+	mv -f "$dir/upload.pending.tmp" "$dir/upload.pending"
 	rm -f "$dir/web.state"
 	wait_for_state "$dir/web.state" failed 10 || fail "out-of-directory upload was not rejected"
 	case "$(state_message "$dir/web.state")" in
@@ -123,24 +170,59 @@ EOF
 		*) fail "out-of-directory upload produced an unexpected message" ;;
 	esac
 
+	# A staged path that walks out of the staging directory is rejected even
+	# though it still carries the incoming prefix.
+	cat >"$dir/upload.pending.tmp" <<EOF
+time=$(date +%s)
+path=${dir}/upload/incoming.1/../../evil
+name=vnt2_web
+size=7
+EOF
+	mv -f "$dir/upload.pending.tmp" "$dir/upload.pending"
+	rm -f "$dir/web.state"
+	wait_for_state "$dir/web.state" failed 10 || fail "parent traversal staged path was not rejected"
+	case "$(state_message "$dir/web.state")" in
+		*'invalid staged path'*) ;;
+		*) fail "parent traversal staged path produced an unexpected message" ;;
+	esac
+
 	# Directory traversal, Windows drive paths and absolute paths are rejected.
-	(
-		cd "$dir" && tar -czf "$dir/traversal.tar.gz" --transform='s|^|../|' vnt2_web
-	) 2>/dev/null
+	tar_rewrite_args '^' '../'
+	tar -czf "$dir/traversal.tar.gz" -C "$dir" $TAR_REWRITE_ARGS vnt2_web ||
+		fail "could not build the traversal archive"
 	queue_file "$dir" "$dir/traversal.tar.gz" "traversal.tar.gz"
 	wait_for_state "$dir/web.state" failed 10 || fail "traversal archive was accepted"
 
-	(
-		cd "$dir" && tar -czf "$dir/windows.tar.gz" --transform='s|^vnt2_web$|C:/evil|' vnt2_web
-	) 2>/dev/null
+	tar_rewrite_args '^vnt2_web$' 'C:/evil'
+	tar -czf "$dir/windows.tar.gz" -C "$dir" $TAR_REWRITE_ARGS vnt2_web ||
+		fail "could not build the Windows drive archive"
 	queue_file "$dir" "$dir/windows.tar.gz" "windows.tar.gz"
 	wait_for_state "$dir/web.state" failed 10 || fail "Windows drive archive was accepted"
 
-	(
-		cd "$dir" && tar -czPf "$dir/absolute.tar.gz" --transform='s|^vnt2_web$|/etc/vnt2_web|' vnt2_web
-	) 2>/dev/null
+	tar_rewrite_args '^vnt2_web$' '/etc/vnt2_web'
+	tar -czPf "$dir/absolute.tar.gz" -C "$dir" $TAR_REWRITE_ARGS vnt2_web ||
+		fail "could not build the absolute path archive"
 	queue_file "$dir" "$dir/absolute.tar.gz" "absolute.tar.gz"
 	wait_for_state "$dir/web.state" failed 10 || fail "absolute path archive was accepted"
+
+	# A binary built for another architecture must be refused before install.
+	make_elf "$dir/foreign_arch_vnt2_web" "$(foreign_elf_machine)"
+	queue_file "$dir" "$dir/foreign_arch_vnt2_web" "vnt2_web"
+	wait_for_state "$dir/web.state" failed 10 || fail "foreign architecture upload was accepted"
+	case "$(state_message "$dir/web.state")" in
+		*'targets'*'router'*) ;;
+		*) fail "foreign architecture upload produced an unexpected message: $(state_message "$dir/web.state")" ;;
+	esac
+
+	# Zip uploads cannot be inspected safely, so they must fail with a clear
+	# message instead of falling through to the raw binary branch.
+	printf 'PK\003\004zip\n' >"$dir/package.zip"
+	queue_file "$dir" "$dir/package.zip" "package.zip"
+	wait_for_state "$dir/web.state" failed 10 || fail "zip upload was accepted"
+	case "$(state_message "$dir/web.state")" in
+		*'zip archives are not supported'*) ;;
+		*) fail "zip upload produced an unexpected message" ;;
+	esac
 
 	# Archives without vnt2_web, non-ELF files and corrupt archives are rejected.
 	mkdir -p "$dir/empty"
@@ -212,6 +294,29 @@ EOF
 	queue_file "$dir" "$dir/nested.tar.gz" "NESTED.TAR.GZ"
 	wait_for_state "$dir/web.state" success 10 || fail "upper-case archive extension was not treated as an archive"
 	[ -f "$dir/bin/vnt2_web" ] || fail "upper-case archive did not install vnt2_web"
+
+	# tar.xz archives are validated and installed like tar.gz archives. bsdtar
+	# has liblzma built in while GNU tar shells out to xz, so probe first.
+	if tar -cJf "$dir/probe.tar.xz" -C "$dir" vnt2_web >/dev/null 2>&1 && [ -s "$dir/probe.tar.xz" ]; then
+		queue_file "$dir" "$dir/probe.tar.xz" "nested.tar.xz"
+		wait_for_state "$dir/web.state" success 10 || fail "tar.xz archive was not installed"
+		[ -f "$dir/bin/vnt2_web" ] || fail "tar.xz archive did not install vnt2_web"
+		printf 'PASS: tar.xz archive was installed\n'
+
+		# A tar.xz archive that escapes the staging directory is rejected too.
+		tar_rewrite_args '^' '../'
+		tar -cJf "$dir/traversal.tar.xz" -C "$dir" $TAR_REWRITE_ARGS vnt2_web ||
+			fail "could not build the tar.xz traversal archive"
+		queue_file "$dir" "$dir/traversal.tar.xz" "traversal.tar.xz"
+		wait_for_state "$dir/web.state" failed 10 || fail "tar.xz traversal archive was accepted"
+		case "$(state_message "$dir/web.state")" in
+			*'invalid tar.xz archive'*) ;;
+			*) fail "tar.xz traversal archive produced an unexpected message" ;;
+		esac
+		printf 'PASS: unsafe tar.xz archive was rejected\n'
+	else
+		printf 'SKIP: tar.xz is not available on this platform\n'
+	fi
 
 	stop_worker "$dir"
 	rm -rf "$dir"

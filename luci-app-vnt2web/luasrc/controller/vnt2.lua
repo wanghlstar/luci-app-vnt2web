@@ -3,7 +3,6 @@ module("luci.controller.vnt2", package.seeall)
 local fs = require "nixio.fs"
 local sys = require "luci.sys"
 local http = require "luci.http"
-local uci = require "luci.model.uci".cursor()
 local toml = require "luci.model.vnt2_toml"
 local textutil = require "luci.model.vnt2_text"
 local LOG_DISPLAY_LINES = 300
@@ -11,6 +10,8 @@ local VERSION_CHECK_PENDING_FILE = "/tmp/vnt2-version-check.pending"
 local VERSION_STATE_FILE = "/etc/config/vnt2-web.version"
 
 function index()
+	local uci = require "luci.model.uci".cursor()
+
 	if not fs.access("/etc/config/vnt2") and not fs.access(toml.TOML_FILE) then
 		return
 	end
@@ -25,9 +26,9 @@ function index()
 	entry({ "admin", "vpn", "vnt2", "status" }, call("act_status")).leaf = true
 	entry({ "admin", "vpn", "vnt2", "check_latest" }, call("act_check_latest")).leaf = true
 	entry({ "admin", "vpn", "vnt2", "get_web_log" }, call("get_web_log")).leaf = true
-	entry({ "admin", "vpn", "vnt2", "clear_web_log" }, call("clear_web_log")).leaf = true
+	entry({ "admin", "vpn", "vnt2", "clear_web_log" }, post_on(true, "clear_web_log")).leaf = true
 	entry({ "admin", "vpn", "vnt2", "get_download_log" }, call("get_download_log")).leaf = true
-	entry({ "admin", "vpn", "vnt2", "clear_download_log" }, call("clear_download_log")).leaf = true
+	entry({ "admin", "vpn", "vnt2", "clear_download_log" }, post_on(true, "clear_download_log")).leaf = true
 
 	entry({ "admin", "vpn", "vnt2", "vnt2_web_cmdline" }, call("vnt2_web_cmdline")).leaf = true
 	entry({ "admin", "vpn", "vnt2", "open_web" }, call("open_web")).leaf = true
@@ -52,7 +53,7 @@ local function plain_write(data)
 	http.write(data or "")
 end
 
-local function uci_first(stype, opt, default)
+local function uci_first(uci, stype, opt, default)
 	local v = uci:get_first("vnt2", stype, opt)
 	if v == nil or v == "" then
 		return default
@@ -60,7 +61,7 @@ local function uci_first(stype, opt, default)
 	return v
 end
 
-local function uci_list(stype, opt)
+local function uci_list(uci, stype, opt)
 	local values = {}
 	uci:foreach("vnt2", stype, function(s)
 		local v = s[opt]
@@ -87,18 +88,18 @@ end
 
 
 
-local function get_web_bin()
-	return uci_first("vnt2_web", "vnt2_web_bin", "/usr/bin/vnt2_web")
+local function get_web_bin(uci)
+	return uci_first(uci, "vnt2_web", "vnt2_web_bin", "/usr/bin/vnt2_web")
 end
 
 
 
-local function get_web_port()
-	return tonumber(uci_first("vnt2_web", "web_port", "19099")) or 19099
+local function get_web_port(uci)
+	return tonumber(uci_first(uci, "vnt2_web", "web_port", "19099")) or 19099
 end
 
-local function get_web_host()
-	return uci_first("vnt2_web", "web_host", "0.0.0.0")
+local function get_web_host(uci)
+	return uci_first(uci, "vnt2_web", "web_host", "0.0.0.0")
 end
 
 
@@ -113,7 +114,12 @@ local function get_pid_by_name(name)
 end
 
 local function get_pid_by_path(path)
-	local base = tostring(path or ""):match("([^/]+)$")
+	path = trim(tostring(path or ""))
+	if path == "" then
+		return nil
+	end
+
+	local base = path:match("([^/]+)$")
 	if base and base ~= "" then
 		local pid = get_pid_by_name(base)
 		if pid then
@@ -121,7 +127,7 @@ local function get_pid_by_path(path)
 		end
 	end
 
-	local pid = trim(sys.exec("ps -w 2>/dev/null | grep " .. shell_quote(path or "") .. " | grep -v grep | awk 'NR==1{print $1}'"))
+	local pid = trim(sys.exec("ps -w 2>/dev/null | grep " .. shell_quote(path) .. " | grep -v grep | awk 'NR==1{print $1}'"))
 	if pid ~= "" then
 		return pid
 	end
@@ -130,8 +136,8 @@ local function get_pid_by_path(path)
 end
 
 
-local function get_web_pid()
-	return get_pid_by_path(get_web_bin())
+local function get_web_pid(uci)
+	return get_pid_by_path(get_web_bin(uci))
 end
 
 
@@ -164,39 +170,58 @@ local function format_runtime(tag_file)
 	return string.format("%02dh %02dm %02ds", hour, min, sec)
 end
 
+local CLK_TCK, PAGE_SIZE, CPU_COUNT
+
 local function get_clk_tck()
+	if CLK_TCK then
+		return CLK_TCK
+	end
+
 	local value = tonumber(trim(sys.exec("getconf CLK_TCK 2>/dev/null"))) or 100
 	if value < 1 then
 		value = 100
 	end
-	return value
+
+	CLK_TCK = value
+	return CLK_TCK
 end
 
 local function get_page_size()
+	if PAGE_SIZE then
+		return PAGE_SIZE
+	end
+
 	local value = tonumber(trim(sys.exec("getconf PAGESIZE 2>/dev/null"))) or 4096
 	if value < 1 then
 		value = 4096
 	end
-	return value
+
+	PAGE_SIZE = value
+	return PAGE_SIZE
 end
 
 local function get_cpu_count()
+	if CPU_COUNT then
+		return CPU_COUNT
+	end
+
 	local count = tonumber(trim(sys.exec([[awk '/^cpu[0-9]+ /{n++} END{print n?n:1}' /proc/stat 2>/dev/null]]))) or 1
 	if count < 1 then
 		count = 1
 	end
-	return count
-end
 
-local CLK_TCK = get_clk_tck()
-local PAGE_SIZE = get_page_size()
-local CPU_COUNT = get_cpu_count()
+	CPU_COUNT = count
+	return CPU_COUNT
+end
 
 local function get_cpu_usage(pid)
 	pid = trim(pid)
 	if pid == "" or not pid:match("^%d+$") then
 		return ""
 	end
+
+	local clk_tck = get_clk_tck()
+	local cpu_count = get_cpu_count()
 
 	local stat = fs.readfile("/proc/" .. pid .. "/stat")
 	if not stat or stat == "" then
@@ -226,15 +251,15 @@ local function get_cpu_usage(pid)
 		return ""
 	end
 
-	local elapsed = uptime - (starttime / CLK_TCK)
+	local elapsed = uptime - (starttime / clk_tck)
 	if elapsed <= 0 then
 		return "0.00%"
 	end
 
-	local total = (utime + stime) / CLK_TCK
+	local total = (utime + stime) / clk_tck
 	local cpu = (total / elapsed) * 100
-	if CPU_COUNT > 1 then
-		cpu = cpu / CPU_COUNT
+	if cpu_count > 1 then
+		cpu = cpu / cpu_count
 	end
 	if cpu < 0 then
 		cpu = 0
@@ -249,13 +274,15 @@ local function get_mem_usage(pid)
 		return ""
 	end
 
+	local page_size = get_page_size()
+
 	local status = fs.readfile("/proc/" .. pid .. "/status") or ""
 	local rss_kb = tonumber(status:match("VmRSS:%s*(%d+)"))
 	if not rss_kb then
 		local statm = fs.readfile("/proc/" .. pid .. "/statm") or ""
 		local rss_pages = tonumber(statm:match("^%S+%s+(%d+)"))
 		if rss_pages then
-			rss_kb = (rss_pages * PAGE_SIZE) / 1024
+			rss_kb = (rss_pages * page_size) / 1024
 		end
 	end
 
@@ -326,7 +353,7 @@ local function get_local_tag(bin_path)
 end
 
 local function sanitize_cache_name(s)
-	return tostring(s or ""):gsub("[^%w%._-]", "_")
+	return tostring(s or ""):gsub("[^A-Za-z0-9._-]", "_")
 end
 
 local function normalize_download_mirror(mirror)
@@ -407,6 +434,9 @@ function act_check_latest()
 	local value = tostring(os.time()) .. "\n"
 	local ok = fs.writefile(temp, value)
 
+	if ok and not fs.chmod(temp, "0600") then
+		ok = false
+	end
 	if ok then
 		ok = os.rename(temp, VERSION_CHECK_PENDING_FILE) and true or false
 	end
@@ -415,10 +445,6 @@ function act_check_latest()
 	end
 
 	json_write({ ok = ok and true or false })
-end
-
-local function get_log_content(path, max_lines)
-	return textutil.read_log_file(path, max_lines)
 end
 
 local function parse_state_file(path)
@@ -465,27 +491,34 @@ local function get_cmdline(pid)
 end
 
 
-local function get_router_host()
-	local http_host = trim(http.getenv("HTTP_HOST") or "")
-	if http_host ~= "" then
-		local host = http_host:match("^%[([^%]]+)%]") or http_host:match("^([^:]+)")
-		host = trim(host)
-		if host ~= "" then
-			return host
-		end
-	end
+local function get_lan_ip()
+	return trim(sys.exec("uci -q get network.lan.ipaddr 2>/dev/null | head -n1"))
+end
 
+local function get_router_host(uci)
+	-- Prefer the address the request was served from; unlike the Host header
+	-- it can not be forged by the client.
 	local server_addr = trim(http.getenv("SERVER_ADDR") or "")
 	if server_addr ~= "" then
 		return server_addr
 	end
 
-	local lan_ip = trim(sys.exec("uci -q get network.lan.ipaddr 2>/dev/null | head -n1"))
+	-- Only trust the Host header when it points at the router itself.
+	local lan_ip = get_lan_ip()
+	local http_host = trim(http.getenv("HTTP_HOST") or "")
+	if http_host ~= "" then
+		local host = http_host:match("^%[([^%]]+)%]") or http_host:match("^([^:]+)")
+		host = trim(host)
+		if host ~= "" and host == lan_ip then
+			return host
+		end
+	end
+
 	if lan_ip ~= "" then
 		return lan_ip
 	end
 
-	local web_host = get_web_host()
+	local web_host = get_web_host(uci)
 	if web_host == "0.0.0.0" or web_host == "::" or web_host == "127.0.0.1" or web_host == "::1" then
 		return "192.168.1.1"
 	end
@@ -493,9 +526,9 @@ local function get_router_host()
 	return web_host
 end
 
-local function build_web_url()
-	local host = get_router_host()
-	local port = get_web_port()
+local function build_web_url(uci)
+	local host = get_router_host(uci)
+	local port = get_web_port(uci)
 
 	if host:find(":", 1, true) and not host:match("^%[.*%]$") then
 		host = "[" .. host .. "]"
@@ -506,27 +539,28 @@ end
 
 
 
-local function summarize_web_config()
+local function summarize_web_config(uci)
 	return {
-		host = get_web_host(),
-		port = get_web_port(),
-		wan = uci_first("vnt2_web", "web_wan", "1"),
-		log_level = uci_first("vnt2_web", "log_level", "info"),
-		auto_download = uci_first("vnt2_web", "auto_download", "1"),
-		download_repo = uci_first("vnt2_web", "download_repo", "vnt-dev/vnt"),
-		download_tag = uci_first("vnt2_web", "download_tag", "latest"),
-		download_mirror = uci_first("vnt2_web", "download_mirror", "auto"),
-		custom_download_mirror = uci_first("vnt2_web", "custom_download_mirror", "")
+		host = get_web_host(uci),
+		port = get_web_port(uci),
+		wan = uci_first(uci, "vnt2_web", "web_wan", "1"),
+		log_level = uci_first(uci, "vnt2_web", "log_level", "info"),
+		auto_download = uci_first(uci, "vnt2_web", "auto_download", "1"),
+		download_repo = uci_first(uci, "vnt2_web", "download_repo", "vnt-dev/vnt"),
+		download_tag = uci_first(uci, "vnt2_web", "download_tag", "latest"),
+		download_mirror = uci_first(uci, "vnt2_web", "download_mirror", "auto"),
+		custom_download_mirror = uci_first(uci, "vnt2_web", "custom_download_mirror", "")
 	}
 end
 
 
 function act_status()
+	local uci = require "luci.model.uci".cursor()
 	local e = {}
-	local web_enabled = uci_first("vnt2_web", "enabled", "0") == "1"
+	local web_enabled = uci_first(uci, "vnt2_web", "enabled", "0") == "1"
 
-	local web_pid = get_web_pid()
-	local web_cfg = summarize_web_config()
+	local web_pid = get_web_pid(uci)
+	local web_cfg = summarize_web_config(uci)
 	local web_dl = parse_state_file("/tmp/vnt2-download-web.state")
 
 	-- This endpoint is polled every five seconds. Keep it local-only so an
@@ -539,12 +573,12 @@ function act_status()
 
 	-- Never execute managed binaries from this polling endpoint. A broken or
 	-- blocked binary must not delay LuCI while an apply-triggered restart runs.
-	e.web_tag = get_local_tag(get_web_bin())
+	e.web_tag = get_local_tag(get_web_bin(uci))
 	e.latest_web_tag = get_vnt2_latest_tag(web_cfg.download_repo, web_cfg.download_mirror, web_cfg.custom_download_mirror)
 
-	e.web_host = get_web_host()
-	e.web_port = get_web_port()
-	e.web_url = build_web_url()
+	e.web_host = get_web_host(uci)
+	e.web_port = get_web_port(uci)
+	e.web_url = build_web_url(uci)
 
 	e.web_log_level = web_cfg.log_level
 	e.web_wan = web_cfg.wan
@@ -554,40 +588,60 @@ function act_status()
 	e.web_download_mirror = web_cfg.download_mirror
 	e.web_custom_download_mirror = web_cfg.custom_download_mirror
 
-	e.download_log_size = #(get_log_content("/tmp/vnt2-download.log") or "")
 	e.web_download = web_dl
 
 	json_write(e)
 end
 
+local function log_warn(message)
+	sys.call("logger -t luci.vnt2 " .. shell_quote(message) .. " >/dev/null 2>&1")
+end
+
 local function clear_log_file(path)
 	if not path or path == "" then
-		return
+		return false, translate("无效的日志文件路径")
 	end
-	fs.writefile(path, "")
+
+	if not fs.writefile(path, "") then
+		return false, translate("无法清空日志文件")
+	end
+
+	return true
 end
 
 
 
 function get_web_log()
-	plain_write(get_log_content("/tmp/vnt2-web.log", LOG_DISPLAY_LINES))
+	plain_write(textutil.read_log_file("/tmp/vnt2-web.log", LOG_DISPLAY_LINES))
 end
 
 function clear_web_log()
-	clear_log_file("/tmp/vnt2-web.log")
-	json_write({ ok = true })
+	local ok, err = clear_log_file("/tmp/vnt2-web.log")
+	if not ok then
+		log_warn("clear_web_log failed: " .. tostring(err))
+	end
+
+	json_write({ ok = ok, error = ok and nil or err })
 end
 
 
 
 function get_download_log()
-	plain_write(get_log_content("/tmp/vnt2-download.log", LOG_DISPLAY_LINES))
+	plain_write(textutil.read_log_file("/tmp/vnt2-download.log", LOG_DISPLAY_LINES))
 end
 
 function clear_download_log()
-	clear_log_file("/tmp/vnt2-download.log")
-	fs.remove("/tmp/vnt2-download-web.state")
-	json_write({ ok = true })
+	local ok, err = clear_log_file("/tmp/vnt2-download.log")
+	if ok and fs.access("/tmp/vnt2-download-web.state")
+		and not fs.remove("/tmp/vnt2-download-web.state") then
+		ok = false
+		err = translate("无法删除下载状态文件")
+	end
+	if not ok then
+		log_warn("clear_download_log failed: " .. tostring(err))
+	end
+
+	json_write({ ok = ok, error = ok and nil or err })
 end
 
 
@@ -596,11 +650,12 @@ end
 
 
 function vnt2_web_cmdline()
-	local pid = get_pid_by_path(get_web_bin())
+	local uci = require "luci.model.uci".cursor()
+	local pid = get_pid_by_path(get_web_bin(uci))
 	local cmdline = get_cmdline(pid)
 
 	if cmdline == "" then
-		cmdline = "错误：vnt2_web 未运行。"
+		cmdline = translate("错误：vnt2_web 未运行。")
 	end
 
 	json_write({ cmdline = cmdline })
@@ -608,5 +663,6 @@ end
 
 
 function open_web()
-	http.redirect(build_web_url())
+	local uci = require "luci.model.uci".cursor()
+	http.redirect(build_web_url(uci))
 end

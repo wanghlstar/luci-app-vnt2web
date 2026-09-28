@@ -3,39 +3,93 @@ local sys = require "luci.sys"
 local util = require "luci.util"
 
 local M = {}
-local tail_available = sys.call("command -v tail >/dev/null 2>&1") == 0
+
+-- Mojibake signatures: a UTF-8 byte triple that was decoded as GBK/GB18030
+-- surfaces as one character plus the "?" replacement character. Each entry is
+-- built from its three hex bytes because several of the decoded characters
+-- differ only in a single byte and are indistinguishable on screen.
+local function mojibake_marker(hex)
+	local bytes = {}
+	for byte in hex:gmatch("%x%x") do
+		bytes[#bytes + 1] = string.char(tonumber(byte, 16))
+	end
+	return table.concat(bytes) .. "?"
+end
 
 local mojibake_markers = {
-	string.char(233, 150, 186, 63),
-	string.char(233, 151, 129, 63),
-	string.char(230, 191, 160, 63),
-	string.char(230, 191, 158, 63),
-	string.char(230, 191, 161, 63),
-	string.char(233, 151, 130, 63),
-	string.char(233, 150, 187, 63),
-	string.char(231, 188, 130, 63),
-	string.char(233, 150, 184, 63),
-	string.char(231, 128, 185, 63),
-	string.char(229, 169, 181, 63),
-	string.char(233, 144, 160, 63),
-	string.char(231, 188, 129, 63)
+	mojibake_marker("E9 96 BA"), -- 闁?
+	mojibake_marker("E9 97 81"), -- 闁?
+	mojibake_marker("E6 BF A0"), -- 濠?
+	mojibake_marker("E6 BF 9E"), -- 濞?
+	mojibake_marker("E6 BF A1"), -- 濡?
+	mojibake_marker("E9 97 82"), -- 闂?
+	mojibake_marker("E9 96 BB"), -- 閻?
+	mojibake_marker("E7 BC 82"), -- 缂?
+	mojibake_marker("E9 96 B8"), -- 閸?
+	mojibake_marker("E7 80 B9"), -- 瀹?
+	mojibake_marker("E5 A9 B5"), -- 婵?
+	mojibake_marker("E9 90 A0"), -- 鐠?
+	mojibake_marker("E7 BC 81") -- 缁?
 }
 
 local function iconv_available()
 	return sys.call("command -v iconv >/dev/null 2>&1") == 0
 end
 
-local function run_iconv_command(cmd)
+-- Large logs must not be passed on the command line, so repairs always stream
+-- through a temporary file instead of a shell argument.
+local function temp_path(suffix)
+	local stat = fs.readfile("/proc/self/stat") or ""
+	local pid = stat:match("^(%d+)") or tostring(os.time())
+	return string.format("/tmp/vnt2-text.%s.%s.%s", pid, tostring(os.time()), suffix)
+end
+
+-- Round-trip the file through UTF-8 -> GB18030 -> UTF-8, which restores log
+-- lines whose UTF-8 bytes were mistakenly decoded as GB18030.
+local function run_iconv_chain(path)
 	if not iconv_available() then
 		return nil
 	end
 
-	local repaired = sys.exec(cmd)
-	if repaired and repaired ~= "" then
-		return repaired
+	local repaired_path = temp_path("repaired")
+	if not repaired_path then
+		return nil
 	end
 
-	return nil
+	local command = string.format(
+		"iconv -f UTF-8 -t GB18030 <%s 2>/dev/null | iconv -f GB18030 -t UTF-8 >%s 2>/dev/null",
+		util.shellquote(path), util.shellquote(repaired_path)
+	)
+	if sys.call(command) ~= 0 then
+		fs.remove(repaired_path)
+		return nil
+	end
+
+	local repaired = fs.readfile(repaired_path) or ""
+	fs.remove(repaired_path)
+	if repaired == "" then
+		return nil
+	end
+	return repaired
+end
+
+local function count_mojibake_markers(content)
+	content = tostring(content or "")
+	local count = 0
+
+	for _, marker in ipairs(mojibake_markers) do
+		local pos = 1
+		while true do
+			local found = content:find(marker, pos, true)
+			if not found then
+				break
+			end
+			count = count + 1
+			pos = found + #marker
+		end
+	end
+
+	return count
 end
 
 local log_message_exact_map = {
@@ -96,8 +150,14 @@ function M.sanitize_text(content)
 	content = tostring(content or "")
 	content = content:gsub("\27%[[%d;?]*[%a]", "")
 	content = content:gsub("\27%][^\7]*\7", "")
-	content = content:gsub("%z", "")
-	content = content:gsub("\r", "")
+	-- Drop NUL, CR and the remaining C0 control characters, including a stray
+	-- escape and DEL, while keeping \n and \t for readable log output.
+	content = content:gsub("[%c]", function(char)
+		if char == "\n" or char == "\t" then
+			return char
+		end
+		return ""
+	end)
 	return content
 end
 
@@ -161,29 +221,46 @@ function M.looks_like_mojibake(content)
 	return false
 end
 
+-- Keep the repaired text only when it removes mojibake markers, otherwise the
+-- original content is returned untouched. A conversion that stops on invalid
+-- input can leave a truncated prefix behind, which is rejected as well.
+local function accept_repair(original, repaired)
+	if not repaired or repaired == "" then
+		return original
+	end
+	if count_mojibake_markers(repaired) >= count_mojibake_markers(original) then
+		return original
+	end
+	if #repaired < #original and original:sub(1, #repaired) == repaired then
+		return original
+	end
+	return repaired
+end
+
 function M.repair_mojibake_text(content)
 	content = tostring(content or "")
 	if content == "" or not M.looks_like_mojibake(content) then
 		return content
 	end
 
-	local repaired = run_iconv_command(string.format(
-		"printf '%%s' %s | iconv -f UTF-8 -t GB18030 2>/dev/null",
-		util.shellquote(content)
-	))
-	return repaired or content
+	local source_path = temp_path("source")
+	if not source_path then
+		return content
+	end
+	if not fs.writefile(source_path, content) then
+		fs.remove(source_path)
+		return content
+	end
+
+	local repaired = run_iconv_chain(source_path)
+	fs.remove(source_path)
+	return accept_repair(content, repaired)
 end
 
 function M.read_text_file(path)
 	local content = path and path ~= "" and fs.access(path) and (fs.readfile(path) or "") or ""
 	if content ~= "" and path and path ~= "" and M.looks_like_mojibake(content) then
-		local repaired = run_iconv_command(string.format(
-			"iconv -f UTF-8 -t GB18030 %s 2>/dev/null",
-			util.shellquote(path)
-		))
-		if repaired then
-			content = repaired
-		end
+		content = accept_repair(content, run_iconv_chain(path))
 	end
 
 	return M.sanitize_text(content)
@@ -235,8 +312,9 @@ function M.read_log_file(path, max_lines)
 
 	local content = ""
 	if path and path ~= "" and fs.access(path) then
-		if tail_available then
-			content = sys.exec(string.format("tail -n %d %s 2>/dev/null", limit, util.shellquote(path))) or ""
+		local ok, tailed = pcall(sys.exec, string.format("tail -n %d %s 2>/dev/null", limit, util.shellquote(path)))
+		if ok and tailed then
+			content = tailed
 		end
 		if content == "" then
 			content = keep_last_lines(M.read_text_file(path), limit)

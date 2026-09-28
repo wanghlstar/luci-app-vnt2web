@@ -30,6 +30,18 @@ assert_equal() {
 	[ "$actual" = "$expected" ] || fail "$message: expected [$expected], got [$actual]"
 }
 
+# GNU tar rewrites archived member names with --transform, while bsdtar uses -s
+# and takes the substitution delimiter as the first character of the pattern.
+# Developers run these tests on macOS and CI runs on Ubuntu, so both dialects
+# have to work; a skipped tar command would silently drop the whole check.
+tar_rewrite_args() {
+	if tar --version 2>/dev/null | grep -q 'GNU tar'; then
+		TAR_REWRITE_ARGS="--transform=s|$1|$2|"
+	else
+		TAR_REWRITE_ARGS="-s |$1|$2|"
+	fi
+}
+
 test_mirror_candidates() {
 	load_function trim_value
 	load_function normalize_download_mirror
@@ -149,7 +161,9 @@ test_archive_safety() {
 	tar -czf "$dir/safe.tar.gz" -C "$dir/source" vnt2_web
 	archive_is_safe "$dir/safe.tar.gz" || fail "safe tar archive was rejected"
 
-	tar -czf "$dir/traversal.tar.gz" -C "$dir/source" --transform='s#vnt2_web#../vnt2_web#' vnt2_web 2>/dev/null
+	tar_rewrite_args 'vnt2_web' '../vnt2_web'
+	tar -czf "$dir/traversal.tar.gz" -C "$dir/source" $TAR_REWRITE_ARGS vnt2_web ||
+		fail "could not build the parent traversal archive"
 	if archive_is_safe "$dir/traversal.tar.gz"; then
 		fail "tar archive containing parent traversal was accepted"
 	fi

@@ -5,6 +5,30 @@ local check_latest_url = dsp.build_url("admin", "vpn", "vnt2", "check_latest")
 local open_web_url = dsp.build_url("admin", "vpn", "vnt2", "open_web")
 local web_log_url = dsp.build_url("admin", "vpn", "vnt2", "web_log")
 local download_log_url = dsp.build_url("admin", "vpn", "vnt2", "download_log")
+
+-- translate() can not be called from the script block below, so localize the
+-- strings here and hand them over as ready to use JavaScript literals.
+local function js_literal(s)
+	s = translate(tostring(s or ""))
+	s = s:gsub("\\", "\\\\")
+	s = s:gsub('"', '\\"')
+	s = s:gsub("</", "<\\/")
+	s = s:gsub("\r", "")
+	s = s:gsub("\n", "\\n")
+	return '"' .. s .. '"'
+end
+
+local i18n_strings = {
+	running = js_literal("运行中"),
+	stopped = js_literal("未运行"),
+	enabled = js_literal("已启用"),
+	disabled = js_literal("未启用"),
+	state = js_literal("状态："),
+	tag = js_literal("版本："),
+	arch = js_literal("架构："),
+	asset = js_literal("资源："),
+	time = js_literal("时间：")
+}
 %>
 
 <style type="text/css">
@@ -95,25 +119,25 @@ local download_log_url = dsp.build_url("admin", "vpn", "vnt2", "download_log")
 	<div class="vnt2-status-grid">
 		<div class="vnt2-card">
 			<h3>
-				vnt2_web 客户端
-				<span id="web_status_badge" class="vnt2-badge vnt2-off">未运行</span>
+				<%:vnt2_web 客户端%>
+				<span id="web_status_badge" class="vnt2-badge vnt2-off"><%:未运行%></span>
 			</h3>
 			<table>
-				<tr><td>本地版本</td><td id="web_tag">-</td></tr>
-				<tr><td>最新版本</td><td id="web_latest_tag">-</td></tr>
-				<tr><td>运行时长</td><td id="web_runtime">-</td></tr>
-				<tr><td>进程/PID</td><td id="web_pid">-</td></tr>
-				<tr><td>CPU / 内存</td><td id="web_usage">-</td></tr>
-				<tr><td>监听地址</td><td id="web_addr">-</td></tr>
-				<tr><td>日志级别</td><td id="web_log_level">-</td></tr>
-				<tr><td>WAN 放行</td><td id="web_wan">-</td></tr>
-				<tr><td>访问地址</td><td id="web_url">-</td></tr>
-				<tr><td>下载状态</td><td id="web_download">-</td></tr>
+				<tr><td><%:本地版本%></td><td id="web_tag">-</td></tr>
+				<tr><td><%:最新版本%></td><td id="web_latest_tag">-</td></tr>
+				<tr><td><%:运行时长%></td><td id="web_runtime">-</td></tr>
+				<tr><td><%:进程/PID%></td><td id="web_pid">-</td></tr>
+				<tr><td><%:CPU / 内存%></td><td id="web_usage">-</td></tr>
+				<tr><td><%:监听地址%></td><td id="web_addr">-</td></tr>
+				<tr><td><%:日志级别%></td><td id="web_log_level">-</td></tr>
+				<tr><td><%:WAN 放行%></td><td id="web_wan">-</td></tr>
+				<tr><td><%:访问地址%></td><td id="web_url">-</td></tr>
+				<tr><td><%:下载状态%></td><td id="web_download">-</td></tr>
 			</table>
 			<div class="vnt2-links">
-				<a href="<%=open_web_url%>" target="_blank" rel="noopener noreferrer">打开 Web 页面</a>
-				<a href="<%=web_log_url%>">查看 Web 日志</a>
-				<a href="<%=download_log_url%>">查看下载日志</a>
+				<a href="<%=open_web_url%>" target="_blank" rel="noopener noreferrer"><%:打开 Web 页面%></a>
+				<a href="<%=web_log_url%>"><%:查看 Web 日志%></a>
+				<a href="<%=download_log_url%>"><%:查看下载日志%></a>
 			</div>
 		</div>
 	</div>
@@ -123,8 +147,19 @@ local download_log_url = dsp.build_url("admin", "vpn", "vnt2", "download_log")
 <script type="text/javascript">
 //<![CDATA[
 (function() {
-	var statusUrl = "<%=status_url%>";
-	var checkLatestUrl = "<%=check_latest_url%>";
+	var statusUrl = "<%=pcdata(status_url)%>";
+	var checkLatestUrl = "<%=pcdata(check_latest_url)%>";
+	var i18n = {
+		running: <%=i18n_strings.running%>,
+		stopped: <%=i18n_strings.stopped%>,
+		enabled: <%=i18n_strings.enabled%>,
+		disabled: <%=i18n_strings.disabled%>,
+		state: <%=i18n_strings.state%>,
+		tag: <%=i18n_strings.tag%>,
+		arch: <%=i18n_strings.arch%>,
+		asset: <%=i18n_strings.asset%>,
+		time: <%=i18n_strings.time%>
+	};
 
 	function byId(id) {
 		return document.getElementById(id);
@@ -147,7 +182,7 @@ local download_log_url = dsp.build_url("admin", "vpn", "vnt2", "download_log")
 	}
 
 	function yesNo(v) {
-		return String(v) === "1" ? "已启用" : "未启用";
+		return String(v) === "1" ? i18n.enabled : i18n.disabled;
 	}
 
 	function joinList(v) {
@@ -165,7 +200,7 @@ local download_log_url = dsp.build_url("admin", "vpn", "vnt2", "download_log")
 		var node = byId(id);
 		if (!node) return;
 		node.className = "vnt2-badge " + (running ? "vnt2-on" : "vnt2-off");
-		node.innerHTML = running ? "运行中" : "未运行";
+		node.innerHTML = running ? i18n.running : i18n.stopped;
 	}
 
 	function setHtml(id, value) {
@@ -178,12 +213,12 @@ local download_log_url = dsp.build_url("admin", "vpn", "vnt2", "download_log")
 	function stateText(obj) {
 		if (!obj) return "-";
 		var items = [];
-		if (obj.state) items.push("状态：" + text(obj.state));
-		if (obj.tag) items.push("版本：" + text(obj.tag));
-		if (obj.arch) items.push("架构：" + text(obj.arch));
-		if (obj.asset) items.push("资源：" + text(obj.asset));
+		if (obj.state) items.push(i18n.state + text(obj.state));
+		if (obj.tag) items.push(i18n.tag + text(obj.tag));
+		if (obj.arch) items.push(i18n.arch + text(obj.arch));
+		if (obj.asset) items.push(i18n.asset + text(obj.asset));
 		if (obj.message) items.push(text(obj.message));
-		if (obj.time) items.push("时间：" + text(obj.time));
+		if (obj.time) items.push(i18n.time + text(obj.time));
 		return items.length ? items.join("<br />") : "-";
 	}
 
@@ -201,7 +236,7 @@ local download_log_url = dsp.build_url("admin", "vpn", "vnt2", "download_log")
 		setHtml("web_tag", text(data.web_tag));
 		setHtml("web_latest_tag", text(data.latest_web_tag));
 		setHtml("web_runtime", text(data.web_runtime));
-		setHtml("web_pid", data.web_running ? ("PID " + text(data.web_pid)) : "未运行");
+		setHtml("web_pid", data.web_running ? ("PID " + text(data.web_pid)) : i18n.stopped);
 		setHtml("web_usage", [text(data.web_cpu, "0"), text(data.web_ram, "0 MB")].join(" / "));
 		setHtml("web_addr", text(data.web_host) + ":" + text(data.web_port));
 		setHtml("web_log_level", text(data.web_log_level));

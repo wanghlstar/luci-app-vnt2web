@@ -1,0 +1,129 @@
+#!/bin/sh
+
+PENDING_FILE="${VNT2_DOWNLOAD_PENDING_FILE:-/tmp/vnt2-download-missing.pending}"
+CLAIMED_FILE="${VNT2_DOWNLOAD_CLAIMED_FILE:-/tmp/vnt2-download-missing.claimed}"
+DOWNLOAD_LOG="${VNT2_DOWNLOAD_LOG_FILE:-/tmp/vnt2-download.log}"
+DOWNLOAD_COMMAND="${VNT2_DOWNLOAD_COMMAND:-/etc/init.d/vnt2}"
+DOWNLOAD_DELAY="${VNT2_DOWNLOAD_DELAY:-2}"
+POLL_INTERVAL="${VNT2_DOWNLOAD_POLL_INTERVAL:-1}"
+RETRY_BACKOFF="${VNT2_DOWNLOAD_RETRY_BACKOFF:-5 10 20}"
+RETRY_LIMIT="${VNT2_DOWNLOAD_RETRY_LIMIT:-3}"
+RETRY_CYCLE_DELAY="${VNT2_DOWNLOAD_RETRY_CYCLE_DELAY:-60}"
+
+normalize_seconds() {
+	local value fallback
+
+	value="$1"
+	fallback="$2"
+
+	case "$value" in
+		''|*[!0-9]*)
+			printf '%s\n' "$fallback"
+			return 0
+		;;
+	esac
+	# Strip leading zeros: dash evaluates "08" as an invalid octal number.
+	value="$(printf '%s' "$value" | sed 's/^0*//')"
+	[ -n "$value" ] || value=0
+	printf '%s\n' "$value"
+}
+
+log_worker() {
+	printf '%s download-worker : %s\n' "$(date '+%Y-%m-%d %H:%M:%S')" "$(printf '%s' "$*" | tr -d '\r\n\000')" >>"${DOWNLOAD_LOG}"
+}
+
+read_request_time() {
+	local request_time
+
+	request_time="$(sed -n '1p' "$1" 2>/dev/null)"
+	case "$request_time" in
+		''|*[!0-9]*) request_time="$(date +%s)" ;;
+		*)
+			# Strip leading zeros: dash evaluates "08" as an invalid octal
+			# number in $(( )) and would abort the whole worker loop.
+			request_time="$(printf '%s' "$request_time" | sed 's/^0*//')"
+			[ -n "$request_time" ] || request_time=0
+		;;
+	esac
+	printf '%s\n' "$request_time"
+}
+
+claim_latest_request() {
+	[ -f "$PENDING_FILE" ] || return 1
+	mv -f "$PENDING_FILE" "$CLAIMED_FILE" 2>/dev/null
+}
+
+run_download() {
+	local rc
+
+	log_worker "download worker starts missing binary download"
+	VNT2_RESTART_MODE=apply "$DOWNLOAD_COMMAND" download_missing </dev/null >/dev/null 2>&1
+	rc=$?
+	if [ "$rc" -eq 0 ]; then
+		log_worker "download worker completed missing binary download"
+	else
+		log_worker "download worker missing binary download failed rc=${rc}"
+	fi
+	return "$rc"
+}
+
+# A failed download must not drop the request: the claimed marker survives and
+# the command is retried with a growing backoff before it is abandoned.
+run_download_with_retry() {
+	retries=0
+	set -- $RETRY_BACKOFF
+
+	while :; do
+		if run_download; then
+			return 0
+		fi
+		if [ "$retries" -ge "$RETRY_LIMIT" ] || [ "$#" -eq 0 ]; then
+			log_worker "download worker missing binary download abandoned after ${retries} retries"
+			return 1
+		fi
+		retries=$((retries + 1))
+		backoff="$1"
+		shift
+		log_worker "download worker missing binary download retry ${retries} scheduled in ${backoff}s"
+		sleep "$backoff"
+	done
+}
+
+trap 'exit 0' INT TERM
+
+DOWNLOAD_DELAY="$(normalize_seconds "$DOWNLOAD_DELAY" 2)"
+POLL_INTERVAL="$(normalize_seconds "$POLL_INTERVAL" 1)"
+RETRY_LIMIT="$(normalize_seconds "$RETRY_LIMIT" 3)"
+RETRY_CYCLE_DELAY="$(normalize_seconds "$RETRY_CYCLE_DELAY" 60)"
+
+while :; do
+	if [ ! -f "$CLAIMED_FILE" ]; then
+		claim_latest_request || {
+			sleep "$POLL_INTERVAL"
+			continue
+		}
+	fi
+
+	request_time="$(read_request_time "$CLAIMED_FILE")"
+	now="$(date +%s)"
+	age=$((now - request_time))
+	# A marker stamped in the future must run immediately, not wait forever.
+	[ "$age" -lt 0 ] && age=0
+	if [ "$age" -le "$DOWNLOAD_DELAY" ]; then
+		sleep "$POLL_INTERVAL"
+		continue
+	fi
+
+	# A newer page-load marker restarts the debounce window.
+	if claim_latest_request; then
+		continue
+	fi
+
+	if run_download_with_retry; then
+		rm -f "$CLAIMED_FILE"
+	else
+		# A failed download keeps the claimed marker so the request is not
+		# lost and the next cycle retries it.
+		sleep "$RETRY_CYCLE_DELAY"
+	fi
+done

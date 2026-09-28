@@ -56,10 +56,16 @@ check_project_contracts() {
 
 	grep -Fq 'PKG_NAME:=luci-app-vnt2web' "$SOURCE_DIR/Makefile" ||
 		fail "package name is not luci-app-vnt2web"
-	grep -Fq 'PKG_VERSION:=2.0.53' "$SOURCE_DIR/Makefile" ||
-		fail "package version is not 2.0.53"
-	grep -Fq 'PKG_RELEASE:=2' "$SOURCE_DIR/Makefile" ||
-		fail "package release is not 2"
+	# The version is read from the Makefile instead of being pinned here, so a
+	# release bump does not turn this check red.
+	pkg_version="$(sed -n 's/^PKG_VERSION[[:space:]]*:=[[:space:]]*//p' "$SOURCE_DIR/Makefile" | head -n1 | tr -d '[:space:]')"
+	[ -n "$pkg_version" ] || fail "package version is not defined in ${SOURCE_DIR}/Makefile"
+	printf '%s\n' "$pkg_version" | grep -Eq '^[0-9]+(\.[0-9]+)+$' ||
+		fail "package version ${pkg_version} is not a dotted numeric version"
+	pkg_release="$(sed -n 's/^PKG_RELEASE[[:space:]]*:=[[:space:]]*//p' "$SOURCE_DIR/Makefile" | head -n1 | tr -d '[:space:]')"
+	[ -n "$pkg_release" ] || fail "package release is not defined in ${SOURCE_DIR}/Makefile"
+	printf '%s\n' "$pkg_release" | grep -Eq '^[0-9]+$' ||
+		fail "package release ${pkg_release} is not a plain revision number"
 	grep -Fq 'WEB_CONF_DEFAULT="/etc/config/vnt2.toml"' "$SOURCE_DIR/root/etc/init.d/vnt2" ||
 		fail "runtime TOML path is not fixed in the init script"
 	grep -Fq 'M.TOML_FILE = "/etc/config/vnt2.toml"' "$SOURCE_DIR/luasrc/model/vnt2_toml.lua" ||
@@ -91,16 +97,23 @@ check_line_endings() {
 			printf 'FAIL: CRLF line ending found: %s\n' "$file" >&2
 			exit 1
 		fi
+		if LC_ALL=C grep -q '[[:space:]]$' "$file"; then
+			printf 'FAIL: trailing whitespace found: %s\n' "$file" >&2
+			LC_ALL=C grep -n '[[:space:]]$' "$file" >&2
+			exit 1
+		fi
 	done
-	printf 'PASS: project source files use LF line endings\n'
+	printf 'PASS: project source files use LF line endings without trailing whitespace\n'
 }
 
 check_shell_syntax() {
 	find "$SOURCE_DIR" "${ROOT_DIR}/tests" -type f -print | LC_ALL=C sort |
 	while IFS= read -r script; do
 		first_line="$(sed -n '1p' "$script" || true)"
+		# Only plain POSIX shell scripts are checked here: a bash or env
+		# wrapper would be reported by its own interpreter.
 		case "$first_line" in
-			'#!'*'sh'*)
+			'#!/bin/sh'*|'#!/usr/bin/env sh'*)
 				dash -n "$script"
 			;;
 		esac
@@ -181,22 +194,25 @@ check_utf8_and_bom() {
 	}
 
 	if command -v python3 >/dev/null 2>&1; then
+		# The embedded Python must start at column zero: an indented first
+		# statement is an IndentationError, and the shell tab style would
+		# otherwise be copied into the program text.
 		input_files | LC_ALL=C sort | python3 -c '
-			import codecs
-			import os
-			import sys
+import codecs
+import os
+import sys
 
-			for raw_path in sys.stdin.buffer:
-				path = os.fsdecode(raw_path.rstrip(b"\n"))
-				with open(path, "rb") as handle:
-					data = handle.read()
-				if data.startswith(codecs.BOM_UTF8):
-					raise SystemExit("UTF-8 BOM found: " + path)
-				try:
-					data.decode("utf-8")
-				except UnicodeDecodeError as error:
-					raise SystemExit("Invalid UTF-8 in {}: {}".format(path, error))
-		'
+for raw_path in sys.stdin.buffer:
+	path = os.fsdecode(raw_path.rstrip(b"\n"))
+	with open(path, "rb") as handle:
+		data = handle.read()
+	if data.startswith(codecs.BOM_UTF8):
+		raise SystemExit("UTF-8 BOM found: " + path)
+	try:
+		data.decode("utf-8")
+	except UnicodeDecodeError as error:
+		raise SystemExit("Invalid UTF-8 in {}: {}".format(path, error))
+'
 	elif command -v perl >/dev/null 2>&1; then
 		input_files | LC_ALL=C sort | perl -MEncode=decode -e '
 			while (defined(my $path = <STDIN>)) {
@@ -225,10 +241,5 @@ run_tests
 check_lua_syntax
 check_yaml_syntax
 check_utf8_and_bom
-(
-	cd "$ROOT_DIR"
-	git diff --check
-)
-printf 'PASS: git diff --check passed\n'
 
 printf 'source validation passed\n'

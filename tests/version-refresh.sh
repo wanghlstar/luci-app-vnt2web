@@ -48,7 +48,9 @@ test_luci_request_is_local_only() {
 	if printf '%s\n' "$definition" | grep -Fq 'fs.writefile(VERSION_CHECK_PENDING_FILE'; then
 		fail "latest-version request has a non-atomic direct-write fallback"
 	fi
-	if printf '%s\n' "$definition" | grep -Eq 'sys\.(call|exec)|curl|wget|uclient-fetch|/etc/init\.d/vnt2'; then
+	# The same synchronous-execution patterns the upload handler is checked
+	# against must not appear here either.
+	if printf '%s\n' "$definition" | grep -Eq 'sys\.(call|exec)|nixio\.(exec|syscall)|os\.execute|curl|wget|uclient-fetch|/etc/init\.d/vnt2'; then
 		fail "latest-version LuCI request performs synchronous external work"
 	fi
 	grep -Fq 'XHR.get(checkLatestUrl' "$STATUS_VIEW" || \
@@ -67,7 +69,7 @@ test_local_version_state() {
 		fail "controller does not parse the version sidecar"
 	grep -Fq 'local function get_local_tag(bin_path)' "$CONTROLLER" || \
 		fail "local version helper does not validate against the version sidecar"
-	grep -Fq 'e.web_tag = get_local_tag(get_web_bin())' "$CONTROLLER" || \
+	grep -Fq 'e.web_tag = get_local_tag(get_web_bin(uci))' "$CONTROLLER" || \
 		fail "status endpoint does not resolve the local version from the sidecar"
 	grep -Fq 'state.path ~= bin_path' "$CONTROLLER" || \
 		fail "local version helper does not reject a sidecar for a different path"
