@@ -33,7 +33,7 @@ OpenWrt LuCI 界面，用于管理 [VNT2](https://github.com/vnt-dev/vnt) 的 `v
 
 ### 方式一：Release 安装（推荐）
 
-到 [Releases](https://github.com/wanghlstar/luci-app-vnt2/releases) 下载对应包：
+到 [Releases](https://github.com/wanghlstar/luci-app-vnt2web/releases) 下载对应包：
 
 ```bash
 # OpenWrt 24.10 及更早（opkg）
